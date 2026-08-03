@@ -1,0 +1,16 @@
+pkgbase = dockh
+	pkgdesc = A GTK4 layer-shell dock for Hyprland, written in Zig (rewrite of nwg-dock-hyprland)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/jesusalcaladev/dockh
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = zig
+	makedepends = pkg-config
+	depends = gtk4
+	depends = gtk4-layer-shell
+	source = dockh::git+https://github.com/jesusalcaladev/dockh.git
+	sha256sums = SKIP
+
+pkgname = dockh

@@ -1,24 +1,26 @@
-get:
-	go get github.com/diamondburned/gotk4-layer-shell/pkg/gtklayershell
-	go get github.com/diamondburned/gotk4/pkg
-	go get github.com/joshuarubin/go-sway
-	go get github.com/allan-simon/go-singleinstance
-	go get "github.com/sirupsen/logrus"
+PREFIX ?= /usr/local
+BINDIR := $(PREFIX)/bin
+DATADIR := $(PREFIX)/share/dockh
+
+.PHONY: all build install uninstall run clean
+
+all: build
 
 build:
-	go build -v -o bin/nwg-dock-hyprland .
+	zig build -Doptimize=ReleaseFast
 
-install:
-	-pkill -f nwg-dock-hyprland
-	sleep 1
-	mkdir -p /usr/share/nwg-dock-hyprland
-	cp -r images /usr/share/nwg-dock-hyprland
-	cp config/* /usr/share/nwg-dock-hyprland
-	cp bin/nwg-dock-hyprland /usr/bin
+install: build
+	install -Dm755 zig-out/bin/dockh $(DESTDIR)$(BINDIR)/dockh
+	# Keep config/ in sync with src/defaults/ (the embedded first-run copies).
+	install -Dm644 config/style.css $(DESTDIR)$(DATADIR)/style.css
+	install -Dm644 config/config.toml $(DESTDIR)$(DATADIR)/config.toml
 
 uninstall:
-	rm -r /usr/share/nwg-dock-hyprland
-	rm /usr/bin/nwg-dock-hyprland
+	rm -f $(DESTDIR)$(BINDIR)/dockh
+	rm -rf $(DESTDIR)$(DATADIR)
 
-run:
-	go run .
+run: build
+	./zig-out/bin/dockh
+
+clean:
+	rm -rf zig-out .zig-cache
