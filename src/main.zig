@@ -11,15 +11,16 @@
 //!   hypr/  — Hyprland IPC (ipc.zig) and freedesktop .desktop entries (desktop.zig)
 //!   ui/    — dock widgets (widgets.zig) and theming (theme.zig)
 const std = @import("std");
-const c = @import("c.zig");
+const c = @import("c"); // named module (build.zig)
 const config_mod = @import("core/config.zig");
 const hypr = @import("hypr/ipc.zig");
 const desktop = @import("hypr/desktop.zig");
 const widgets = @import("ui/widgets.zig");
 const blur = @import("ui/blur.zig");
+const glass = @import("ui/glass.zig");
 const status_mod = @import("ui/status.zig");
 const cssmod = @import("ui/theme.zig");
-const fs = @import("core/fs.zig");
+const fs = @import("fs"); // named module (build.zig)
 const log = @import("core/log.zig");
 const state = @import("core/state.zig");
 
@@ -40,7 +41,17 @@ var event_buf_len: usize = 0;
 var allow_multiple = false;
 var cfg_file_override: []const u8 = "";
 
+// Config hot reload: dockh-config (or any editor) rewrites config.toml, the
+// GFileMonitor below fires and the dock re-executes itself with the same
+// argv — position/layer/margins/glass all need a fresh window, so a full
+// restart is the reliable way to apply them. `saved_argv` keeps the original
+// command line (minus argv[0], which is replaced by /proc/self/exe).
+var config_monitor: ?*anyopaque = null;
+var config_debounce: c_uint = 0;
+var saved_argv: []const [:0]const u8 = &.{};
+
 var main_loop: ?*anyopaque = null;
+var last_trim_ms: i64 = 0; // throttle the post-rebuild trim (see refreshClients)
 
 // ---------------------------------------------------------------------------
 // Paths & env helpers
@@ -371,7 +382,13 @@ fn setupMainWindow() void {
 
     c.gtk_box_append(outer_box, alignment_box);
     c.gtk_box_append(alignment_box, main_box);
-    c.gtk_window_set_child(win, outer_box);
+    // Real GLSL liquid glass: a GtkOverlay with the glass behind and the box
+    // on top. Null (no GL / no grim) → plain box = pure-CSS glass fallback.
+    if (glass.createOverlay(outer_box)) |overlay| {
+        c.gtk_window_set_child(win, overlay);
+    } else {
+        c.gtk_window_set_child(win, outer_box);
+    }
 
     state.outer_box = outer_box;
     state.alignment_box = alignment_box;
@@ -726,8 +743,13 @@ fn handleHyprEventLine(line: []const u8) void {
 
     if (std.mem.startsWith(u8, line, "activewindowv2>>")) {
         const addr = std.mem.trim(u8, line["activewindowv2>>".len..], " \r");
-        if (!std.mem.eql(u8, addr, state.last_win_addr) and !std.mem.containsAtLeast(u8, addr, 1, ">>")) {
-            state.last_win_addr = state.alloc.dupe(u8, addr) catch "";
+        const same = addr.len == state.last_win_addr_len and
+            std.mem.eql(u8, addr, state.last_win_addr_buf[0..state.last_win_addr_len]);
+        if (!same and !std.mem.containsAtLeast(u8, addr, 1, ">>")) {
+            if (addr.len <= state.last_win_addr_buf.len) {
+                @memcpy(state.last_win_addr_buf[0..addr.len], addr);
+                state.last_win_addr_len = addr.len;
+            }
             refreshClients();
         }
     } else if (std.mem.startsWith(u8, line, "workspacev2>>")) {
@@ -738,6 +760,8 @@ fn handleHyprEventLine(line: []const u8) void {
             state.active_ws_id = std.fmt.parseInt(i32, id_part, 10) catch state.active_ws_id;
         }
         refreshClients();
+        // the wallpaper behind the glass changed with the workspace
+        glass.onBackgroundChanged();
     } else if (std.mem.startsWith(u8, line, "focusedmon>>")) {
         // focusedmon>>MONITOR,WORKSPACEID
         const rest = std.mem.trim(u8, line["focusedmon>>".len..], " \r");
@@ -746,11 +770,18 @@ fn handleHyprEventLine(line: []const u8) void {
             state.active_ws_id = std.fmt.parseInt(i32, id_part, 10) catch state.active_ws_id;
         }
         refreshClients();
+        glass.onBackgroundChanged();
     } else if (std.mem.startsWith(u8, line, "openwindow>>") or
         std.mem.startsWith(u8, line, "closewindow>>") or
-        std.mem.startsWith(u8, line, "movewindow>>") or
         std.mem.startsWith(u8, line, "fullscreen>>"))
     {
+        // a window appeared/disappeared over the dock area — refresh the
+        // glass background so no stale window is left in the texture
+        refreshClients();
+        glass.onBackgroundChanged();
+    } else if (std.mem.startsWith(u8, line, "movewindow>>")) {
+        // dragging windows fires movewindow constantly — rebuild the icons
+        // but skip the (debounced) background capture storm
         refreshClients();
     }
 }
@@ -805,11 +836,214 @@ fn refreshClients() void {
     }
     state.workspace_has_windows = workspaceOccupied();
     widgets.rebuildMainBox();
+    // Return the old widget tree's pages right away — but throttled: a window
+    // drag fires movewindow every frame, and trimming on EVERY rebuild would
+    // eat CPU during that storm. The 5s/30s timers cover the rest.
+    const now_ms = nowMs();
+    if (now_ms - last_trim_ms >= 2000) {
+        last_trim_ms = now_ms;
+        _ = c.malloc_trim(0);
+    }
     updateActivityVisibility();
 }
 
 pub fn requestRebuild() void {
     refreshClients();
+}
+
+// ---------------------------------------------------------------------------
+// Config hot reload (GFileMonitor on config.toml → self-restart via exec)
+// ---------------------------------------------------------------------------
+
+/// True for the GFileMonitor events that mean "the file content changed"
+/// (excludes metadata-only noise from chmod/touch).
+fn configContentEvent(ev: c_int) bool {
+    return switch (ev) {
+        c.G_FILE_MONITOR_EVENT_CHANGED,
+        c.G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT,
+        c.G_FILE_MONITOR_EVENT_DELETED,
+        c.G_FILE_MONITOR_EVENT_CREATED,
+        c.G_FILE_MONITOR_EVENT_MOVED,
+        c.G_FILE_MONITOR_EVENT_RENAMED,
+        c.G_FILE_MONITOR_EVENT_MOVED_IN,
+        c.G_FILE_MONITOR_EVENT_MOVED_OUT,
+        => true,
+        else => false,
+    };
+}
+
+fn onConfigFileChanged(_: ?*anyopaque, _: ?*anyopaque, _: ?*anyopaque, event_type: c_int, _: ?*anyopaque) callconv(.c) void {
+    if (!configContentEvent(event_type)) return; // chmod/touch noise
+    if (config_debounce != 0) {
+        _ = c.g_source_remove(config_debounce);
+        config_debounce = 0;
+    }
+    // Debounce: editors may emit several events in a row (write, rename,
+    // metadata). Wait until things settle, then restart.
+    config_debounce = c.g_timeout_add(250, @ptrCast(&onConfigDebounce), null);
+}
+
+fn onConfigDebounce(_: ?*anyopaque) callconv(.c) c_int {
+    config_debounce = 0;
+    applyConfigReload();
+    return 0; // G_SOURCE_REMOVE
+}
+
+/// Structural keys need a fresh window (widget tree, layer-shell geometry,
+/// glass overlay, pinned/ignore lists) — any change to them forces the
+/// execv self-restart. Everything else re-applies live below.
+fn configStructuralChanged(new: *const config_mod.Config) bool {
+    const o = &state.cfg;
+    if (!std.mem.eql(u8, o.position, new.position)) return true;
+    if (!std.mem.eql(u8, o.alignment, new.alignment)) return true;
+    if (o.full != new.full) return true;
+    if (!std.mem.eql(u8, o.layer, new.layer)) return true;
+    if (o.exclusive != new.exclusive) return true;
+    if (o.icon_size != new.icon_size) return true;
+    if (o.num_workspaces != new.num_workspaces) return true;
+    if (!std.mem.eql(u8, o.target_output, new.target_output)) return true;
+    if (o.margin_top != new.margin_top or o.margin_bottom != new.margin_bottom or
+        o.margin_left != new.margin_left or o.margin_right != new.margin_right) return true;
+    if (!std.mem.eql(u8, o.launcher_cmd, new.launcher_cmd)) return true;
+    if (!std.mem.eql(u8, o.launcher_icon, new.launcher_icon)) return true;
+    if (o.no_launcher != new.no_launcher) return true;
+    if (!std.mem.eql(u8, o.launcher_pos, new.launcher_pos)) return true;
+    if (!std.mem.eql(u8, o.hotspot_layer, new.hotspot_layer)) return true;
+    if (o.hotspot_size != new.hotspot_size) return true;
+    if (!std.mem.eql(u8, o.css_file, new.css_file)) return true;
+    if (o.glass_enabled != new.glass_enabled) return true;
+    // Lists (pinned / ignore classes / workspaces) also rebuild the dock.
+    if (o.pinned.len != new.pinned.len) return true;
+    for (o.pinned, new.pinned) |a, b| if (!std.mem.eql(u8, a, b)) return true;
+    if (o.ignore_classes.len != new.ignore_classes.len) return true;
+    for (o.ignore_classes, new.ignore_classes) |a, b| if (!std.mem.eql(u8, a, b)) return true;
+    if (o.ignore_workspaces.len != new.ignore_workspaces.len) return true;
+    for (o.ignore_workspaces, new.ignore_workspaces) |a, b| if (!std.mem.eql(u8, a, b)) return true;
+    return false;
+}
+
+/// Re-parse config.toml. If only SOFT keys changed (magnify, glass params,
+/// badge, glow, progress, system, animation, autohide…) we re-apply them
+/// live — no restart, no flicker. Structural keys (position, layer, margins,
+/// icon_size, pinned…) still need the execv restart (fresh window).
+///
+/// The Config is parsed into a fresh struct so keys REMOVED from the file
+/// fall back to defaults, then the live sections are pushed into the running
+/// subsystems: the magnify ladder CSS is regenerated (theme.loadAnimation),
+/// the glass shader re-renders with the new uniforms, the badge/progress/
+/// system polls read state.cfg on their next tick anyway.
+fn applyConfigReload() void {
+    const path = cfgPath();
+    if (path.len == 0) return;
+
+    var fresh: config_mod.Config = config_mod.Config.defaults();
+    if (fs.pathExists(path)) {
+        config_mod.parseFile(state.alloc, path, &fresh) catch |e| switch (e) {
+            error.ConfigFileNotFound => {},
+            else => {
+                // Mid-write race (editor truncates then writes): keep the OLD
+                // config entirely — applying defaults here would reset every
+                // soft key live or trigger a spurious restart. The 250 ms
+                // debounce already absorbs transient writes; the next event
+                // re-parses the finished file.
+                log.warn("config reload: parse failed, keeping current config: {any}", .{e});
+                return;
+            },
+        };
+    }
+
+    if (configStructuralChanged(&fresh)) {
+        log.info("config.toml changed structurally — restarting to apply", .{});
+        restartForConfigReload();
+        return;
+    }
+
+    // Soft-only change: apply live.
+    const old_badge = state.cfg.badge_enabled;
+    const old_progress = state.cfg.progress_enabled;
+    state.cfg = fresh;
+
+    // Magnify ladder / hover scale / transitions are generated CSS — swap it.
+    cssmod.loadAnimation(&state.cfg);
+    // Glass uniforms are read per-render from state.cfg — queue a redraw.
+    glass.refresh();
+    // Badge/progress/system polls read state.cfg on their next tick.
+    if (old_badge != state.cfg.badge_enabled) {
+        log.info("config live: badge {s}", .{if (state.cfg.badge_enabled) "on" else "off"});
+    }
+    if (old_progress != state.cfg.progress_enabled) {
+        log.info("config live: media progress {s}", .{if (state.cfg.progress_enabled) "on" else "off"});
+    }
+    // Intelli-hide / autohide read state.cfg in the visibility tick — poke it.
+    updateActivityVisibility();
+    log.info("config.toml re-applied live (magnify/glass/badge/…)", .{});
+}
+
+/// Re-execute the dock with the original argv. execv keeps the PID (the lock
+/// file fd is O_CLOEXEC, so the flock is released atomically and the fresh
+/// process re-acquires it). If exec fails we keep running with the old config.
+///
+/// IMPORTANT: the exec path must be the RESOLVED binary path, not
+/// /proc/self/exe — the kernel derives the process name (comm) from the
+/// basename of the path passed to execve, so exec'ing /proc/self/exe renames
+/// the running dock to "exe" and breaks pkill -x dockh / autostart scripts.
+fn restartForConfigReload() void {
+    log.info("config.toml changed — restarting to apply", .{});
+    // Resolve the real binary path once (reads /proc/self/exe via readlink).
+    if (!resolveSelfPath()) return;
+
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    defer argv.deinit(state.alloc);
+    argv.append(state.alloc, &self_exe_path) catch return;
+    // saved_argv[0] is the original program path — skip it (argv[0] is the
+    // resolved binary path above), keep the real flags.
+    for (saved_argv[1..]) |a| {
+        argv.append(state.alloc, a.ptr) catch return;
+    }
+    argv.append(state.alloc, null) catch return;
+    // argv has an explicit trailing null; cast the pointer to the sentinel
+    // form execv expects.
+    const argv_p: [*:null]const ?[*:0]const u8 = @ptrCast(argv.items.ptr);
+    _ = c.execv(&self_exe_path, argv_p);
+    log.err("config reload: execv failed — continuing with old config", .{});
+}
+
+// Resolved path of the running binary (readlink /proc/self/exe), NUL-terminated.
+var self_exe_path: [4096:0]u8 = undefined;
+var self_exe_len: usize = 0;
+
+fn resolveSelfPath() bool {
+    if (self_exe_len > 0) return true;
+    const n = c.readlink("/proc/self/exe", &self_exe_path, self_exe_path.len);
+    if (n <= 0 or n >= self_exe_path.len) return false;
+    self_exe_path[@intCast(n)] = 0;
+    self_exe_len = @intCast(n);
+    return true;
+}
+
+/// Start watching config.toml. Must run AFTER the first-run default write,
+/// or the initial copy would trigger an immediate self-restart loop.
+fn setupConfigWatch() void {
+    const path = cfgPath();
+    if (path.len == 0) return;
+    const pz = state.alloc.dupeZ(u8, path) catch return;
+
+    const file = c.g_file_new_for_path(pz.ptr);
+    if (file == null) return;
+    defer c.g_object_unref(file);
+
+    var err: ?*anyopaque = null;
+    const mon = c.g_file_monitor_file(file, c.G_FILE_MONITOR_WATCH_MOVES, null, &err);
+    if (mon == null) {
+        if (err != null) {
+            log.warn("couldn't watch {s}: {any}", .{ path, err });
+            c.g_error_free(err);
+        }
+        return;
+    }
+    config_monitor = mon;
+    _ = c.g_signal_connect(mon, "changed", @ptrCast(&onConfigFileChanged), null);
+    log.info("watching {s} for config hot reload", .{path});
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +1094,12 @@ pub fn main(init: std.process.Init.Minimal) void {
     defer scratch_arena.deinit();
     state.scratch = scratch_arena.allocator();
 
+    state.ui_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer state.ui_arena.deinit();
+    state.ui_alloc = state.ui_arena.allocator();
+
     const args = init.args.toSlice(state.alloc) catch &.{};
+    saved_argv = args; // keep the original command line for config hot reload
 
     // Config file first, then CLI overrides win. Pass 1: locate `-cfg` before
     // anything else so loadConfigFile() reads the overridden file; otherwise
@@ -929,6 +1168,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
     cssmod.loadAnimation(&state.cfg);
 
+    // Config hot reload: dockh-config saving (or any edit) re-execs the dock.
+    // Must run AFTER the first-run default write above.
+    setupConfigWatch();
+
     setupMainWindow();
     setupSignals();
     setupMemoryTrim();
@@ -945,6 +1188,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         // start hidden (autohide), unless intellihide has an empty desktop
         _ = c.g_timeout_add(500, @ptrCast(&onInitialHide), null);
     }
+
+    // Capture the desktop behind the dock BEFORE the window is shown, so the
+    // dock itself never lands in its own liquid-glass background texture.
+    glass.captureStartup();
 
     if (state.win) |w| c.gtk_widget_show(w);
 
@@ -999,10 +1246,53 @@ fn onEarlyMemoryTrim(_: ?*anyopaque) callconv(.c) c_int {
     return 0; // one-shot: remove this source after the first trim
 }
 
+/// RSS in MiB, read from /proc/self/statm (resident set). Cheap, no allocs.
+fn readRssMb() i64 {
+    var buf: [64]u8 = undefined;
+    const fd = c.open("/proc/self/statm", 0); // O_RDONLY
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..@intCast(n)], ' ');
+    _ = it.next(); // total program size (pages)
+    const rss_pages = std.fmt.parseInt(i64, it.next() orelse "0", 10) catch 0;
+    return @divTrunc(rss_pages, 256); // 4096 B/page → MiB
+}
+
+/// The "path especial": a hard RSS cap. Sampled every `memory.watch_sec`:
+/// above `trim_above_mb` the heap is returned to the OS immediately; above
+/// `glass_off_mb` the liquid-glass shader is dropped entirely (emergency
+/// CSS-glass fallback), which frees the GL context — so dockh can NEVER
+/// balloon regardless of what GTK or Mesa do.
+fn onMemoryWatchdog(_: ?*anyopaque) callconv(.c) c_int {
+    const rss = readRssMb();
+    // Log only when something actually happened: malloc_trim returns nonzero
+    // when it released pages, and emergencyDisable returns true only on the
+    // transition — so a persistently-over-limit RSS never spams the log.
+    if (state.cfg.memory_trim_above_mb > 0 and rss >= state.cfg.memory_trim_above_mb) {
+        if (c.malloc_trim(0) != 0) {
+            log.warn("memory watchdog: RSS {d} MB ≥ {d} — heap trimmed", .{ rss, state.cfg.memory_trim_above_mb });
+        }
+    }
+    if (state.cfg.memory_glass_off_mb > 0 and rss >= state.cfg.memory_glass_off_mb) {
+        if (glass.emergencyDisable()) {
+            log.warn("memory watchdog: RSS {d} MB ≥ {d} — dropped liquid glass (CSS glass)", .{ rss, state.cfg.memory_glass_off_mb });
+        }
+    }
+    return 1; // keep watching
+}
+
 fn setupMemoryTrim() void {
     // periodic trim: GTK4 frees transient memory on every dock rebuild, but
     // glibc keeps the pages in the heap — returning them keeps RSS low.
-    _ = c.g_timeout_add(30_000, @ptrCast(&onMemoryTrim), null);
+    _ = c.g_timeout_add(15_000, @ptrCast(&onMemoryTrim), null);
     // one early trim after startup churn settles (CSS, icons, first refresh)
     _ = c.g_timeout_add(5_000, @ptrCast(&onEarlyMemoryTrim), null);
+    // hard RSS cap (never lets the memory blow up); clamp to >= 2s to avoid
+    // pathological config values hammering /proc.
+    if (state.cfg.memory_watch_sec > 0) {
+        const ms: c_uint = @intCast(@max(state.cfg.memory_watch_sec * 1000, 2000));
+        _ = c.g_timeout_add(ms, @ptrCast(&onMemoryWatchdog), null);
+    }
 }

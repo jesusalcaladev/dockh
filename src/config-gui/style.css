@@ -1,0 +1,250 @@
+/* dockh-config window styling — scoped to the editor so it never touches the
+   dock itself. Loaded by src/config-gui/main.zig via a display provider. */
+
+window.dockh-config-window {
+  background-color: #14171f;
+  color: #e6e9f0;
+}
+
+/* ---------------- Header bar ---------------- */
+
+.dockh-config-window headerbar {
+  background-color: #1a1e29;
+  border-bottom: 1px solid #262c38;
+}
+
+.dockh-cfg-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: #eef1f8;
+}
+
+.dockh-cfg-path {
+  font-size: 10px;
+  color: #6b7380;
+}
+
+/* ---------------- Notebook tabs ---------------- */
+
+.dockh-config-window notebook > header {
+  background-color: #1a1e29;
+  border-bottom: 1px solid #262c38;
+}
+
+.dockh-config-window notebook > header > tabs > tab {
+  padding: 9px 16px;
+  color: #8a93a6;
+  font-weight: 600;
+  font-size: 12px;
+  transition: color 150ms ease, background-color 150ms ease;
+}
+
+.dockh-config-window notebook > header > tabs > tab:hover {
+  color: #cdd3de;
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.dockh-config-window notebook > header > tabs > tab:checked {
+  color: #8ab4ff;
+  background-color: rgba(61, 110, 247, 0.10);
+  box-shadow: inset 0 -2px 0 #3d6ef7;
+}
+
+/* ---------------- Labels ---------------- */
+
+.dockh-config-window label {
+  color: #cdd3de;
+  font-size: 12px;
+}
+
+.dockh-cfg-section {
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #8ab4ff;
+  padding-top: 12px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(138, 180, 255, 0.14);
+}
+
+.dockh-cfg-caption {
+  font-size: 11px;
+  color: #8a93a6;
+  font-style: italic;
+}
+
+.dockh-cfg-status {
+  font-size: 11px;
+  color: #8a93a6;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+/* ---------------- Buttons ---------------- */
+
+.dockh-config-window button {
+  background-color: #232936;
+  border: 1px solid #2c3444;
+  border-radius: 8px;
+  padding: 6px 14px;
+  color: #e6e9f0;
+  font-weight: 500;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.dockh-config-window button:hover {
+  background-color: #2b3242;
+  border-color: #3a4356;
+}
+
+.dockh-config-window button:active {
+  background-color: #313a4e;
+}
+
+.dockh-config-window button.suggested-action {
+  background-color: #3d6ef7;
+  border: 1px solid #4d7cfb;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.dockh-config-window button.suggested-action:hover {
+  background-color: #557df7;
+  border-color: #6a8ff8;
+}
+
+/* ---------------- Entries ---------------- */
+
+.dockh-config-window entry {
+  background-color: #1e232f;
+  border: 1px solid #2c3444;
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: #e6e9f0;
+  caret-color: #8ab4ff;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.dockh-config-window entry:focus {
+  border-color: #3d6ef7;
+  box-shadow: 0 0 0 2px rgba(61, 110, 247, 0.22);
+}
+
+.dockh-config-window entry selection {
+  background-color: #3d6ef7;
+  color: #ffffff;
+}
+
+/* ---------------- Spin buttons ---------------- */
+
+.dockh-config-window spinbutton {
+  background-color: #1e232f;
+  border: 1px solid #2c3444;
+  border-radius: 8px;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.dockh-config-window spinbutton:focus-within {
+  border-color: #3d6ef7;
+  box-shadow: 0 0 0 2px rgba(61, 110, 247, 0.22);
+}
+
+.dockh-config-window spinbutton text {
+  background-color: transparent;
+  color: #e6e9f0;
+  border: none;
+  padding: 0 8px;
+}
+
+.dockh-config-window spinbutton button {
+  background-color: transparent;
+  border: none;
+  border-radius: 0;
+  min-width: 26px;
+  min-height: 28px;
+  color: #aab2c0;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.dockh-config-window spinbutton button:hover {
+  background-color: rgba(138, 180, 255, 0.12);
+  color: #8ab4ff;
+}
+
+/* ---------------- Dropdowns ---------------- */
+
+.dockh-config-window dropdown {
+  background-color: #1e232f;
+  border: 1px solid #2c3444;
+  border-radius: 8px;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.dockh-config-window dropdown:focus-within {
+  border-color: #3d6ef7;
+  box-shadow: 0 0 0 2px rgba(61, 110, 247, 0.22);
+}
+
+.dockh-config-window dropdown button {
+  background-color: transparent;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 12px;
+  color: #e6e9f0;
+}
+
+.dockh-config-window dropdown button:hover {
+  background-color: rgba(138, 180, 255, 0.10);
+}
+
+.dockh-config-window dropdown arrow {
+  color: #8a93a6;
+}
+
+/* ---------------- Switches (macOS style) ---------------- */
+
+.dockh-config-window switch {
+  min-width: 46px;
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 0;
+  background-color: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  transition: background-color 200ms ease, border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.dockh-config-window switch:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.dockh-config-window switch slider {
+  min-width: 22px;
+  min-height: 22px;
+  margin: 1px;
+  border-radius: 999px;
+  background-color: #eef1f8;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  transition: background-color 200ms ease, box-shadow 200ms ease;
+}
+
+.dockh-config-window switch:checked {
+  background-color: #3d6ef7;
+  border-color: #4d7cfb;
+  box-shadow: 0 0 10px rgba(61, 110, 247, 0.35);
+}
+
+.dockh-config-window switch:checked slider {
+  background-color: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+/* ---------------- Glass live preview ---------------- */
+
+window.dockh-config-window drawingarea {
+  background-color: #0d1018;
+  border-radius: 14px;
+  border: 1px solid #2a3040;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 4px 16px rgba(0, 0, 0, 0.35);
+}

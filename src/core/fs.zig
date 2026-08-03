@@ -1,6 +1,9 @@
 //! File I/O straight through libc.
 const std = @import("std");
-const c = @import("../c.zig");
+// Named import "c": resolves to src/c.zig in every module that compiles this
+// file (the dock roots at src/, dockh-config roots at src/config-gui/ where
+// a ../ relative path would leave the module directory).
+const c = @import("c");
 
 pub const Error = error{ FileNotFound, Unreadable, FileTooBig, WriteFailed, OutOfMemory };
 

@@ -3,15 +3,22 @@
 //! overrides. Kept dependency-free on purpose: Zig 0.16 has no runtime TOML
 //! parser in std, and std.json is overkill for a human-edited file.
 const std = @import("std");
-const fs = @import("fs.zig");
+// Named import (build.zig): the dock compiles this file inside its own
+// module, dockh-config imports it as "cfg" — "fs" must resolve the same
+// way in both, so it's a named module, not a relative path.
+const fs = @import("fs");
 
 /// The .dockh-mag-N ladder (theme.zig) extends this much ABOVE
 /// animation.scale so the settle spring (widgets.zig) has headroom to
 /// overshoot visibly — the resting magnify peak maps to exactly
-/// animation.scale and the bounce lands in the zone above it. Single
-/// source of truth: theme.zig and widgets.zig both import it, so the
-/// ladder top and the target mapping can never drift apart.
-pub const SPRING_HEADROOM: f64 = 0.15;
+/// animation.scale and the bounce lands in the zone above it. 0.30 leaves
+/// room for BOTH the settle overshoot AND the release bounce of the click
+/// spring (release_strength default 0.22 of a fully-magnified icon needs
+/// ~0.22·1.5 = 0.33 of extra scale above 1.0 — the ladder must cover it or
+/// the bounce clips at the top). Single source of truth: theme.zig and
+/// widgets.zig both import it, so the ladder top and the target mapping
+/// can never drift apart.
+pub const SPRING_HEADROOM: f64 = 0.30;
 
 pub const Config = struct {
     // [dock]
@@ -23,7 +30,7 @@ pub const Config = struct {
     autohide: bool = false,
     hide_on_activity: bool = false, // intellihide: hide when the active ws has windows
     resident: bool = false,
-    icon_size: i32 = 32,
+    icon_size: i32 = 40,
     num_workspaces: i32 = 10,
     target_output: []const u8 = "",
 
@@ -65,14 +72,54 @@ pub const Config = struct {
     // overshoot) before resting — all in code, no CSS transition.
     magnify_spring: bool = true,
     magnify_spring_strength: f64 = 0.06, // bounce amplitude, fraction of each icon's scale (0–0.25)
+    // macOS click spring: pressing an icon squashes it down briefly, and
+    // releasing it springs back with a pronounced overshoot — the dock's
+    // "launch bounce" when you click an app. Applied only to the clicked
+    // icon, in code, same frame-clock tick as the settle spring.
+    magnify_click_spring: bool = true,
+    magnify_press_strength: f64 = 0.12, // squash depth on press, fraction of scale (0–0.3)
+    magnify_release_strength: f64 = 0.22, // overshoot on release, fraction of scale (0–0.5)
+    // macOS ghost launch: clicking a pinned app that ISN'T running bounces
+    // the icon and fades it out toward the app that opens (the "ghost" that
+    // flies into the launch), like the real dock. Driven in the same
+    // frame-clock tick, in code — a scale/opacity envelope over `ghost_ms`.
+    magnify_ghost_launch: bool = true,
+    magnify_ghost_ms: i64 = 600, // fade+bounce duration in ms
+    magnify_ghost_scale: f64 = 1.35, // peak scale while fading (1.0 = no growth)
 
     // [glow] — in-dock blur/glow behind the active app's icon (self-contained,
     // no compositor blur: GskGLShaderNode on GTK < 4.16, GskBlurNode after).
-    glow_enabled: bool = true,
+    // OFF by default: the blurred copy renders as a grainy "shadow" around
+    // the icon while magnified, so the clean macOS look is the default.
+    glow_enabled: bool = false,
     glow_radius: f32 = 8, // Gaussian radius in px (0 disables)
 
-    // [progress] — macOS-style media progress bar under the icon (playerctl)
-    progress_enabled: bool = true,
+    // [appearance] — icon drop shadow, injected into the CSS dynamically
+    // (theme.zig generates `-gtk-icon-shadow` from these two keys, so it
+    // hot-reloads with config.toml — no style.css editing). Off by default.
+    icon_shadow: bool = false,
+    icon_shadow_radius: f64 = 8, // blur radius in px; 0 = sharp edge
+
+    // [glass] — real GLSL "liquid glass" panel rendered by a GtkGLArea behind
+    // the icons (SDF rounded rect, refraction of the grim-captured desktop,
+    // chromatic dispersion, specular bevel, frost, depth). Requires grim and
+    // an OpenGL 3.3 context; falls back to the pure-CSS glass automatically.
+    // OFF by default: the GL context + desktop re-capture add ~70 MB of RSS,
+    // so the default is the lightweight pure-CSS glass. Opt in per-user.
+    glass_enabled: bool = false,
+    glass_radius: f32 = 22, // corner radius px
+    glass_margin: f32 = 8, // inset px — must match #dockh-box CSS margin
+    glass_refraction: f32 = 0.55,
+    glass_dispersion: f32 = 0.25,
+    glass_splay: f32 = 0.6,
+    glass_frost: f32 = 0.35,
+    glass_depth: f32 = 0.2,
+    glass_light_angle: f32 = -45, // degrees
+    glass_alpha: f32 = 0.85,
+
+    // [progress] — macOS-style media progress bar under the icon (playerctl).
+    // Off by default: it needs playerctl and many users find the bar noisy.
+    progress_enabled: bool = false,
 
     // [badge] — notification counter on the app icon (makoctl). `threshold`
     // is the notification count at which the badge switches to the
@@ -80,6 +127,29 @@ pub const Config = struct {
     // high state entirely (the badge always keeps its base style).
     badge_enabled: bool = true,
     badge_threshold: usize = 5,
+
+    // [system] — optional system monitor (RAM / CPU / temperature) shown in
+    // the RIGHT-CLICK context menu of every dock item (updated on the same
+    // status-poll timers, status.zig pollSystem). Reads /proc/meminfo,
+    // /proc/stat and the first thermal zone — no external tools, no
+    // subprocesses. `ram`/`cpu`/`temp` toggle each segment. `dock` opts into
+    // the ALWAYS-VISIBLE pill in the dock itself (default false — constant
+    // stats in the dock are noise; the menu is the good UX).
+    system_enabled: bool = false,
+    system_dock: bool = false,
+    system_interval_ms: i64 = 2000,
+    system_ram: bool = true,
+    system_cpu: bool = true,
+    system_temp: bool = true,
+
+    // [memory] — RSS watchdog: guarantees dockh never blows up, no matter
+    // what GTK/Mesa do. `watch_sec` samples RSS; above `trim_above_mb` it
+    // forces malloc_trim; above `glass_off_mb` it drops the liquid-glass
+    // shader entirely (hard ceiling — the dock falls back to CSS glass,
+    // freeing the GL context, ~80 MB). 0 disables that step.
+    memory_watch_sec: i64 = 5,
+    memory_trim_above_mb: i64 = 165,
+    memory_glass_off_mb: i64 = 210,
 
     // [apps]
     css_file: []const u8 = "style.css",
@@ -201,6 +271,40 @@ fn applyKey(alloc: std.mem.Allocator, cfg: *Config, section: []const u8, key: []
         cfg.magnify_spring_strength = f;
         return;
     }
+    if (eq(full, "magnify.click_spring")) return setBool(&cfg.magnify_click_spring, value);
+    if (eq(full, "magnify.press_strength")) {
+        var f: f64 = cfg.magnify_press_strength;
+        setFloat(&f, value) catch {};
+        if (f < 0) f = 0;
+        if (f > 0.30) f = 0.30;
+        cfg.magnify_press_strength = f;
+        return;
+    }
+    if (eq(full, "magnify.release_strength")) {
+        var f: f64 = cfg.magnify_release_strength;
+        setFloat(&f, value) catch {};
+        if (f < 0) f = 0;
+        if (f > 0.50) f = 0.50;
+        cfg.magnify_release_strength = f;
+        return;
+    }
+    if (eq(full, "magnify.ghost_launch")) return setBool(&cfg.magnify_ghost_launch, value);
+    if (eq(full, "magnify.ghost_ms")) {
+        var ms: i64 = cfg.magnify_ghost_ms;
+        setInt(&ms, value) catch {};
+        if (ms < 150) ms = 150;
+        if (ms > 2000) ms = 2000;
+        cfg.magnify_ghost_ms = ms;
+        return;
+    }
+    if (eq(full, "magnify.ghost_scale")) {
+        var f: f64 = cfg.magnify_ghost_scale;
+        setFloat(&f, value) catch {};
+        if (f < 1.0) f = 1.0;
+        if (f > 2.5) f = 2.5;
+        cfg.magnify_ghost_scale = f;
+        return;
+    }
 
     if (eq(full, "glow.enabled")) return setBool(&cfg.glow_enabled, value);
     if (eq(full, "glow.radius")) {
@@ -210,7 +314,32 @@ fn applyKey(alloc: std.mem.Allocator, cfg: *Config, section: []const u8, key: []
         return;
     }
 
+    if (eq(full, "appearance.icon_shadow")) return setBool(&cfg.icon_shadow, value);
+    if (eq(full, "appearance.icon_shadow_radius")) {
+        var f: f64 = cfg.icon_shadow_radius;
+        setFloat(&f, value) catch {};
+        if (f < 0) f = 0;
+        if (f > 64) f = 64;
+        cfg.icon_shadow_radius = f;
+        return;
+    }
+
+    if (eq(full, "glass.enabled")) return setBool(&cfg.glass_enabled, value);
+    if (eq(full, "glass.radius")) return setFloatF32(&cfg.glass_radius, value);
+    if (eq(full, "glass.margin")) return setFloatF32(&cfg.glass_margin, value);
+    if (eq(full, "glass.refraction")) return setFloatF32(&cfg.glass_refraction, value);
+    if (eq(full, "glass.dispersion")) return setFloatF32(&cfg.glass_dispersion, value);
+    if (eq(full, "glass.splay")) return setFloatF32(&cfg.glass_splay, value);
+    if (eq(full, "glass.frost")) return setFloatF32(&cfg.glass_frost, value);
+    if (eq(full, "glass.depth")) return setFloatF32(&cfg.glass_depth, value);
+    if (eq(full, "glass.light_angle")) return setFloatF32(&cfg.glass_light_angle, value);
+    if (eq(full, "glass.alpha")) return setFloatF32(&cfg.glass_alpha, value);
+
     if (eq(full, "progress.enabled")) return setBool(&cfg.progress_enabled, value);
+    if (eq(full, "memory.watch_sec")) return setInt(&cfg.memory_watch_sec, value);
+    if (eq(full, "memory.trim_above_mb")) return setInt(&cfg.memory_trim_above_mb, value);
+    if (eq(full, "memory.glass_off_mb")) return setInt(&cfg.memory_glass_off_mb, value);
+
     if (eq(full, "badge.enabled")) return setBool(&cfg.badge_enabled, value);
     if (eq(full, "badge.threshold")) {
         var t: usize = cfg.badge_threshold;
@@ -218,6 +347,19 @@ fn applyKey(alloc: std.mem.Allocator, cfg: *Config, section: []const u8, key: []
         cfg.badge_threshold = t;
         return;
     }
+
+    if (eq(full, "system.enabled")) return setBool(&cfg.system_enabled, value);
+    if (eq(full, "system.dock")) return setBool(&cfg.system_dock, value);
+    if (eq(full, "system.interval_ms")) {
+        var ms: i64 = cfg.system_interval_ms;
+        setInt(&ms, value) catch {};
+        if (ms < 500) ms = 500; // don't hammer /proc faster than 2 Hz
+        cfg.system_interval_ms = ms;
+        return;
+    }
+    if (eq(full, "system.ram")) return setBool(&cfg.system_ram, value);
+    if (eq(full, "system.cpu")) return setBool(&cfg.system_cpu, value);
+    if (eq(full, "system.temp")) return setBool(&cfg.system_temp, value);
 
     if (eq(full, "apps.css_file")) return setStr(alloc, &cfg.css_file, value);
     if (eq(full, "apps.pinned")) return setStrList(alloc, &cfg.pinned, value);
@@ -257,6 +399,11 @@ fn setFloat(dst: *f64, value: []const u8) !void {
     dst.* = std.fmt.parseFloat(f64, v) catch dst.*;
 }
 
+fn setFloatF32(dst: *f32, value: []const u8) !void {
+    const v = std.mem.trim(u8, value, " \t\"");
+    dst.* = std.fmt.parseFloat(f32, v) catch dst.*;
+}
+
 /// Parses `["a", "b", "c"]` (or a bare comma-separated list) into a slice of
 /// freshly allocated strings.
 fn setStrList(alloc: std.mem.Allocator, dst: *[]const []const u8, value: []const u8) !void {
@@ -277,4 +424,199 @@ fn setStrList(alloc: std.mem.Allocator, dst: *[]const []const u8, value: []const
         try out.append(alloc, try alloc.dupe(u8, clean));
     }
     dst.* = try out.toOwnedSlice(alloc);
+}
+
+// ---------------------------------------------------------------------------
+// Text-level accessors for dockh-config: the GUI reads raw values straight
+// from the TOML text (no typed parsing) and writes them back in place, so
+// user comments and formatting survive every save.
+// ---------------------------------------------------------------------------
+
+/// Raw value (quotes stripped, inline comment stripped) of `key` inside
+/// `section` in a TOML-lite `text`. Returns null when not found. The returned
+/// slice is a fresh allocation owned by the caller (alloc.free it).
+pub fn getKeyValue(alloc: std.mem.Allocator, text: []const u8, section: []const u8, key: []const u8) ?[]const u8 {
+    var cur: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+            cur = std.mem.trim(u8, line[1..close], " \t");
+            continue;
+        }
+        if (!eq(cur, section)) continue;
+        const eq_pos = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const k = std.mem.trim(u8, line[0..eq_pos], " \t");
+        if (!eq(k, key)) continue;
+        var value = std.mem.trim(u8, line[eq_pos + 1 ..], " \t");
+        // Strip inline comments (TOML: '#' starts a comment anywhere outside
+        // a quoted string). If the value starts with a quote, keep up to the
+        // closing quote; otherwise cut at the first '#'.
+        if (value.len > 0 and value[0] == '"') {
+            if (std.mem.indexOfScalarPos(u8, value, 1, '"')) |end| {
+                value = value[1..end]; // strip the quotes too
+            }
+        } else if (std.mem.indexOfScalar(u8, value, '#')) |h| {
+            value = std.mem.trim(u8, value[0..h], " \t");
+        }
+        return alloc.dupe(u8, value) catch null;
+    }
+    return null;
+}
+
+/// Replace the value of `key` inside `section` in `text` with `new_value`
+/// (already TOML-formatted, e.g. `"center"` or `32` or `["a", "b"]`),
+/// preserving indentation, inline comments and every other line. If the key
+/// isn't found, it is inserted right after the section header (creating the
+/// section at the end when missing). Returns a fresh allocation.
+pub fn setValueInText(alloc: std.mem.Allocator, text: []const u8, section: []const u8, key: []const u8, new_value: []const u8) ![]u8 {
+    // getKeyValue returns a fresh allocation — capture it once and free it,
+    // otherwise each edit leaks a copy on every save.
+    const existing = getKeyValue(alloc, text, section, key);
+    const exists = existing != null;
+    if (existing) |v| alloc.free(v);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var cur: []const u8 = "";
+    var replaced = false;
+    var section_seen = false;
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len > 0 and line[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, line, ']') orelse {
+                try out.appendSlice(alloc, raw);
+                try out.append(alloc, '\n');
+                continue;
+            };
+            const name = std.mem.trim(u8, line[1..close], " \t");
+            if (eq(name, section)) section_seen = true;
+            // Key missing: insert it right after its section header.
+            if (eq(name, section) and !exists and !replaced) {
+                try out.appendSlice(alloc, raw);
+                try out.append(alloc, '\n');
+                try out.appendSlice(alloc, key);
+                try out.appendSlice(alloc, " = ");
+                try out.appendSlice(alloc, new_value);
+                try out.append(alloc, '\n');
+                replaced = true;
+                cur = name;
+                continue;
+            }
+            cur = name;
+            try out.appendSlice(alloc, raw);
+            try out.append(alloc, '\n');
+            continue;
+        }
+        if (!eq(cur, section) or line.len == 0 or line[0] == '#') {
+            try out.appendSlice(alloc, raw);
+            try out.append(alloc, '\n');
+            continue;
+        }
+        const eq_pos = std.mem.indexOfScalar(u8, line, '=') orelse {
+            try out.appendSlice(alloc, raw);
+            try out.append(alloc, '\n');
+            continue;
+        };
+        const k = std.mem.trim(u8, line[0..eq_pos], " \t");
+        if (exists and eq(k, key)) {
+            // Preserve leading indentation and any inline comment after the
+            // value; replace only the value itself.
+            const trimmed_start = std.mem.trimStart(u8, raw, " \t");
+            const indent = raw[0 .. raw.len - trimmed_start.len];
+            var comment: []const u8 = "";
+            // Find the first '#' that lies OUTSIDE any quoted string — a '#'
+            // inside a quoted value (e.g. app_launcher = "kitty --title '#dev'") is
+            // part of the string, matching getKeyValue's read-side quote
+            // handling. Only an unquoted '#' starts the inline comment.
+            var comment_start: ?usize = null;
+            var in_string = false;
+            var scan = eq_pos + 1;
+            while (scan < raw.len) : (scan += 1) {
+                const ch = raw[scan];
+                if (ch == '"') {
+                    if (in_string and raw[scan - 1] == '\\') continue; // escaped quote
+                    in_string = !in_string;
+                } else if (ch == '#' and !in_string) {
+                    comment_start = scan;
+                    break;
+                }
+            }
+            if (comment_start) |h| {
+                // Keep the comment but normalize the gap to one space, so the
+                // new value never glues to it ("value# comment").
+                comment = std.mem.trimStart(u8, raw[h..], " \t");
+            }
+            try out.appendSlice(alloc, indent);
+            try out.appendSlice(alloc, k);
+            try out.appendSlice(alloc, " = ");
+            try out.appendSlice(alloc, new_value);
+            if (comment.len > 0) {
+                try out.append(alloc, ' ');
+                try out.appendSlice(alloc, comment);
+            }
+            try out.append(alloc, '\n');
+            replaced = true;
+            continue;
+        }
+        try out.appendSlice(alloc, raw);
+        try out.append(alloc, '\n');
+    }
+
+    // Section (or key) missing entirely: append a fresh section at the end.
+    if (!replaced) {
+        if (text.len > 0 and text[text.len - 1] != '\n') try out.append(alloc, '\n');
+        if (!section_seen) {
+            try out.appendSlice(alloc, "\n[");
+            try out.appendSlice(alloc, section);
+            try out.appendSlice(alloc, "]\n");
+        }
+        try out.appendSlice(alloc, key);
+        try out.appendSlice(alloc, " = ");
+        try out.appendSlice(alloc, new_value);
+        try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Shortest clean decimal for a float (trailing zeros stripped): 22.0 -> "22",
+/// 0.55 -> "0.55", 1.5 -> "1.5" — TOML accepts both integer and float forms.
+pub fn fmtFloat(v: f64, buf: []u8) []const u8 {
+    const s = std.fmt.bufPrint(buf, "{d:.6}", .{v}) catch return "0";
+    var end = s.len;
+    while (end > 1 and s[end - 1] == '0') end -= 1;
+    if (end > 1 and s[end - 1] == '.') end -= 1;
+    return s[0..end];
+}
+
+/// TOML-quote a string (escapes backslashes and quotes).
+pub fn quoteStr(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '"');
+    for (s) |ch| {
+        if (ch == '\\' or ch == '"') try out.append(alloc, '\\');
+        try out.append(alloc, ch);
+    }
+    try out.append(alloc, '"');
+    return out.toOwnedSlice(alloc);
+}
+
+/// TOML string array from a list of items: `["a", "b"]`.
+pub fn quoteList(alloc: std.mem.Allocator, items: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (items, 0..) |it, i| {
+        if (i > 0) try out.appendSlice(alloc, ", ");
+        const q = try quoteStr(alloc, it);
+        defer alloc.free(q);
+        try out.appendSlice(alloc, q);
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
 }

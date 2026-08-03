@@ -17,7 +17,7 @@ bindings: the C ABI is hand-declared in `src/c.zig`.
 | | |
 |---|---|
 | 🪟 **GTK4 + GSK** | Hardware rendering (Vulkan/OpenGL) and modern CSS with `transform: scale() / translateY() / rotate()` and `transition` with `cubic-bezier` curves — without disturbing the container's fixed layout. |
-| 🧊 **Liquid glass** | Translucent CSS theme + real compositor blur (`layerrule = blur on, match:namespace dockh`). See [Theming](#theming). |
+| 🧊 **Liquid glass (real GLSL)** | The panel is rendered by a **GtkGLArea running a fragment shader** — SDF rounded rect, refraction of the desktop behind (captured with grim), chromatic dispersion, specular bevel, frost blur and depth tint — with automatic fallback to the CSS glass. See [Theming](#theming). |
 | 📌 **Pinned apps** | Keep your favorite apps in the dock and launch them with one click; pin/unpin from the context menu. Separated from running apps by a divider, with *ghost* (not running) and *running* states visible in CSS. |
 | 🖱️ **Autohide with hotspot** | Per-monitor invisible windows with configurable delay (detector + strip), no polling. |
 | 🧠 **Workspace intellihide** | With `hide_on_activity = true` the dock hides while the active workspace has windows and reappears when it empties. |
@@ -37,11 +37,15 @@ bindings: the C ABI is hand-declared in `src/c.zig`.
 ## 📦 Requirements (Arch / CachyOS / Omarchy)
 
 ```bash
-sudo pacman -S gtk4 gtk4-layer-shell zig
+sudo pacman -S gtk4 gtk4-layer-shell mesa grim zig
 ```
 
-> `gtk4-layer-shell` is in `extra`. On other distros install the equivalents
-> of `gtk4`, `gtk4-layer-shell` and `zig` (0.16+).
+> `gtk4-layer-shell` is in `extra`; `gl` (Mesa) and `grim` are needed for the
+> GLSL liquid-glass panel. On other distros install the equivalents of
+> `gtk4`, `gtk4-layer-shell`, `gl`/`mesa`, `grim` and `zig` (0.16+).
+>
+> 💡 `grim` is optional: if it's missing, dockh falls back to the pure-CSS
+> glass automatically (`glass.enabled = false` in the config does the same).
 
 ---
 
@@ -64,6 +68,7 @@ The script checks `gtk4`, `gtk4-layer-shell` and `zig`, compiles in
 
 ```
 <prefix>/bin/dockh
+<prefix>/bin/dockh-config      # graphical config editor (GUI)
 <prefix>/share/dockh/style.css
 <prefix>/share/dockh/config.toml
 ```
@@ -106,7 +111,7 @@ The first run creates `~/.config/dockh/` with default `config.toml` and
 ```bash
 dockh                       # bottom bar, centered, bottom layer (behind windows)
 dockh -p top -f             # top bar, full width
-dockh -d -i 32              # autohide with hotspot, 32px icons
+dockh -d -i 40              # autohide with hotspot, 40px icons
 dockh -o DP-1 -p left       # left dock on the DP-1 monitor
 dockh -r                    # resident without hotspot (toggle via signal)
 dockh -ha -d                # intellihide + hotspot (very comfortable)
@@ -123,7 +128,7 @@ dockh -ha -d                # intellihide + hotspot (very comfortable)
 -f                       take the full width/height
 -l <overlay|top|bottom>  layer (bottom — behind windows)
 -x                       exclusive zone (reserves space, forces top)
--i <px>                  icon size (32)
+-i <px>                  icon size (40)
 -o <output>              target monitor, e.g. DP-1
 -c <cmd>                 launcher button command (nwg-drawer)
 -ico <icon>              launcher icon (name or path)
@@ -210,8 +215,9 @@ hyprctl layers          # you should see dockh and dockh-hotspot (if using autoh
 ## ⚙️ Configuration
 
 `~/.config/dockh/config.toml` — sections `[dock]`, `[margins]`,
-`[launcher]`, `[hotspot]`, `[animation]`, `[magnify]`, `[progress]`,
-`[badge]`, `[glow]`, `[apps]`:
+`[launcher]`, `[appearance]`, `[hotspot]`, `[animation]`, `[magnify]`,
+`[progress]`, `[badge]`, `[system]`, `[glow]`, `[glass]`, `[memory]`,
+`[apps]`:
 
 ```toml
 [dock]
@@ -223,9 +229,18 @@ exclusive = false          # reserve space (forces layer = top)
 autohide = false           # hide with hotspot
 hide_on_activity = false   # intellihide: hide if the active workspace has windows
 resident = false           # always visible, toggle via signal
-icon_size = 32           # 32px macOS-style icons (magnify on hover)
+icon_size = 40           # macOS-style icons (magnify on hover)
 num_workspaces = 10
 target_output = ""         # "DP-1" — empty = focused monitor
+
+[appearance]
+icon_shadow = false        # soft drop shadow behind each dock icon
+icon_shadow_radius = 8     # blur radius in px; 0 = sharp edge
+
+> **Note:** the shadow is injected dynamically with a high-specificity rule
+> (`#dockh-window .dockh-btn image`), so this setting **wins over** any
+> `-gtk-icon-shadow` you may write in your `style.css`. To customize the
+> shadow, use these two keys instead of editing CSS by hand.
 
 [margins]
 top = 0
@@ -264,9 +279,47 @@ enabled = true             # media progress bar under the icon (playerctl)
 enabled = true             # per-app notification counter (makoctl)
 threshold = 5             # badge turns red (.dockh-badge.high) at >= N; 0 = never
 
+[system]
+enabled = false            # optional RAM/CPU/temp monitor (off by default)
+interval_ms = 2000         # refresh rate (min 500 ms)
+dock = false               # also show a pill in the dock (opt-in)
+ram = true                 # show used RAM (e.g. "RAM 4.2G")
+cpu = true                 # show CPU usage % (e.g. "CPU 23%")
+temp = true                # show CPU temperature (e.g. "52°C")
+
 [glow]
-enabled = true             # in-dock blur halo behind the active app's icon
+enabled = false            # in-dock blur halo behind the active app's icon (off: the blurred
+                          #   copy looks like a grainy "shadow" while magnified)
 radius = 8                # gaussian radius in px (0 disables)
+
+[glass]
+# Real GLSL "liquid glass" panel rendered by a GtkGLArea behind the icons
+# (SDF rounded rect, refraction of the grim-captured desktop, chromatic
+# dispersion, specular bevel, frost blur, depth tint). Re-captured on
+# workspace changes. Falls back to the pure-CSS glass if GL or grim fail.
+# OFF by default: the GL context + desktop re-capture add ~70 MB of RSS,
+# so the lightweight pure-CSS glass is the default. Opt in per-user.
+enabled = false
+radius = 22              # corner radius (px)
+margin = 8               # inset (px) — must match the #dockh-box CSS margin
+refraction = 0.55        # 0..1 bend strength at the panel edges
+splay = 0.6              # 0..1 width of the edge curvature (lens falloff)
+dispersion = 0.25        # 0..1 chromatic separation (prism effect)
+frost = 0.35             # 0..1 frosted blur radius
+depth = 0.2              # 0..1 volumetric tint toward the center
+light_angle = -45        # degrees: direction of the specular bevel highlight
+alpha = 0.85             # 0..1 overall panel opacity
+
+[memory]
+# RSS watchdog — guarantees dockh never eats the machine, no matter what
+# GTK or Mesa do. The dock samples its own RSS every watch_sec seconds:
+#   trim_above_mb:  force malloc_trim when RSS exceeds this (MiB)
+#   glass_off_mb:   drop the liquid-glass shader when RSS exceeds this (MiB)
+#                   → HARD CEILING: falls back to the pure-CSS glass
+#                   (~75 MB, frees the GL context). 0 = never.
+watch_sec = 5
+trim_above_mb = 165
+glass_off_mb = 210
 
 [apps]
 css_file = "style.css"
@@ -279,18 +332,58 @@ ignore_workspaces = []          # e.g. ["special", "10"]
 > `~/.cache/dockh/pinned` (one class per line). The TOML `pinned = [...]` is
 > only used on first run.
 >
-> 🔄 `style.css` hot-reloads (see [Hot reload](#hot-reload)), but `config.toml`
-> values — including `[magnify]` and `[animation]` — apply on the **next
-> start** (the dock parses the config at launch). After editing them, restart
-> dockh: `pkill -x dockh && dockh`.
+> 🔄 Both `style.css` **and** `config.toml` hot-reload (see
+> [Hot reload](#hot-reload)). Soft config sections — `[magnify]`, `[glass]`
+> params, `[badge]`, `[progress]`, `[glow]`, `[system]`, `[animation]`,
+> `[hotspot]` delay, autohide — re-apply **live, no restart**. Only
+> structural keys (position, layer, margins, icon_size, pinned, lists) still
+> restart the dock automatically.
 
 ---
 
 ## 🎨 Theming (liquid glass)
 
-The glass look comes from CSS (`~/.config/dockh/style.css`) + compositor
-blur. Add to your `hyprland.conf` (**Hyprland 0.55+ syntax**, with
-`match:namespace` and the underscore in `ignore_alpha`):
+dockh has **two glass engines**, selected automatically:
+
+| Engine | When | What it renders |
+|---|---|---|
+| **CSS glass** (default) | `glass.enabled = false` (default), or no GL / no grim | The classic theme: `#dockh-box` background gradient + compositor blur (layerrule). Light on RAM. |
+| **GLSL shader** (opt-in) | `[glass] enabled = true` and GL + grim available | A `GtkGLArea` runs the full optical model behind the icons: SDF rounded rect, splay edge normals, refraction of the grim-captured desktop, chromatic dispersion, specular bevel lit by `light_angle`, frost and depth. Adds ~70 MB of Mesa RSS. |
+
+### The GLSL shader (opt-in) ✨
+
+When the shader is active, the window gets the `.glass-on` class and the CSS
+box chrome steps aside (`#dockh-window.glass-on #dockh-box` becomes
+transparent) so only the shader panel + icons are drawn. The desktop region
+behind the dock is captured with **grim** at startup (before the window is
+shown, so the dock never appears in its own background) and re-captured on
+workspace changes — debounced, with a quick hide/show so the recapture is
+clean.
+
+> 🔍 **Why GtkGLArea?** `GskGLShaderNode` is deprecated since GTK 4.16 — the
+> `ngl` (Vulkan) renderer silently ignores it. A `GtkGLArea` gives dockh a
+> real GL 3.3 context where the full GLSL runs, composited over the
+> transparent layer shell. No per-frame cost: the shader only renders when
+> queued, so the dock stays at 60 fps with zero extra load.
+
+Tune the effect from `config.toml`:
+
+```toml
+[glass]
+enabled = true
+refraction = 0.55        # how much the background bends at the edges
+splay = 0.6              # width of the edge curvature (lens falloff)
+dispersion = 0.25        # chromatic separation (prism effect)
+frost = 0.35             # frosted blur of the captured desktop
+light_angle = -45        # degrees: direction of the specular bevel
+```
+
+### The CSS glass (fallback) 🧊
+
+Set `glass.enabled = false` (or remove `grim`) and the look comes from CSS
+(`~/.config/dockh/style.css`) + compositor blur. Add to your `hyprland.conf`
+(**Hyprland 0.55+ syntax**, with `match:namespace` and the underscore in
+`ignore_alpha`):
 
 ```ini
 layerrule = blur on, match:namespace dockh
@@ -330,7 +423,7 @@ Control the effect from `config.toml`:
 
 ```toml
 [glow]
-enabled = true    # turn it off if you prefer just the compositor glass
+enabled = false   # off by default (the clean macOS look); opt in for the halo
 radius = 8       # higher radius = bigger and softer halo
 ```
 
@@ -412,12 +505,127 @@ threshold = 5    # >= 5 notifications -> .dockh-badge.high (red); 0 = never
 > 💡 Badges and the progress bar live inside each button (GtkOverlay) and
 > update **without rebuilding the dock** — zero flicker.
 
+### System monitor (RAM / CPU / temperature) 📊
+
+Optional monitor showing **used RAM, CPU usage % and CPU package
+temperature** — updated **every 2 s** on the same status-poll timers as the
+progress bar and badge. By default it lives in the **right-click context
+menu** of every dock item, as a live "System" section that updates in place
+while the menu is open (no dock clutter):
+
+```toml
+[system]
+enabled = true    # off by default
+interval_ms = 2000
+dock = false      # also show a pill at the end of the dock (opt-in)
+ram = true
+cpu = true
+temp = true
+```
+
+Setting `dock = true` additionally renders a compact pill at the end of the
+dock, so you can keep an eye on resources without opening a menu.
+
+No external tools and **no subprocesses**: RAM is parsed from
+`/proc/meminfo`, CPU % from the `/proc/stat` delta between two samples, and
+temperature from the first readable `/sys/class/thermal/thermal_zone*/temp`
+(if none exists, the `°C` segment is simply hidden). Every segment is
+independent — `ram = false` drops just the RAM text, and when all three are
+false the item disappears entirely (both in the menu and in the dock).
+
+Style it with the `.dockh-sys` class in your `style.css` — a small
+translucent pill in the dock, plain text inside context menus (the
+`.dockh-menu .dockh-sys` rule strips the pill chrome there):
+
+```css
+.dockh-sys {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.85);
+    padding: 2px 10px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+.dockh-menu .dockh-sys {
+    background-color: transparent;
+    padding: 2px 8px;
+}
+```
+
 ### Hot reload ♻️
 
 `style.css` **hot-reloads**: save from your editor and the dock applies it
 instantly, no restart. Syntax errors are logged as `CSS parse: …` and GTK
 keeps showing the last valid theme. Metadata-only events (chmod/touch) are
 ignored.
+
+`config.toml` **hot-reloads too**: the dock watches the file (like
+`dockh-config` does) and re-applies the change **live**:
+
+- **Soft keys** — `[magnify]` (spread, steps, springs, ghost), `[glass]`
+  parameters (refraction, dispersion, frost, alpha…), `[badge]`,
+  `[progress]`, `[glow]`, `[system]`, `[animation]`, hotspot delay,
+  autohide/intellihide — are pushed into the running dock **without a
+  restart**: the magnify CSS ladder is regenerated, the glass shader
+  re-renders with the new uniforms, and the badge/progress/system polls pick
+  up the new values on their next tick.
+- **Structural keys** — `position`, `layer`, `exclusive`, `icon_size`,
+  margins, `target_output`, `num_workspaces`, launcher, `css_file`, pinned /
+  ignore lists, and toggling `glass.enabled` on/off — need a fresh window, so
+  the dock **re-executes itself** with the same flags. The restart keeps the
+  same PID (the lock is re-acquired atomically). If `exec` ever fails the
+  dock keeps running with the old config and logs an error.
+
+The log says `config.toml re-applied live` for soft changes and `changed
+structurally — restarting` for the rest — so you always know which path ran.
+
+---
+
+## 🖥️ dockh-config — graphical editor
+
+> 🧩 Ships as a separate binary (`dockh-config`), a regular GTK4 window that
+> edits `~/.config/dockh/config.toml` with **no layer shell**.
+
+### Launching
+
+```bash
+dockh-config                # edit the default config file
+dockh-config -cfg /path/to/config.toml   # edit another file
+```
+
+Or from the dock itself: **right-click any icon → Configuration…**. The item
+is on every context menu (running apps, pinned apps and the launcher) and
+spawns the sibling `dockh-config` binary next to `dockh` (with a PATH-search
+fallback), so it works no matter how the dock was installed.
+
+It writes the default `config.toml` on first run if none exists, exactly like
+`dockh` does.
+
+### The tabs
+
+| Tab | What it edits |
+|---|---|
+| **Apariencia** | position, alignment, full, layer, exclusive zone, icon size, workspaces, target output, margins, launcher button |
+| **Comportamiento** | auto-hide, intelli-hide, resident, hotspot (delay/layer/size), animation scale/duration/curve |
+| **Widgets** | magnify (spread, steps, ease, settle/click springs, ghost launch), media progress, notification badge, system monitor, active-app glow |
+| **Glass** | liquid-glass shader on/off and all optical parameters (refraction, dispersion, frost, depth, …) |
+| **Apps** | stylesheet file, pinned apps, ignored classes/workspaces |
+| **Memoria** | the RSS watchdog: watch interval, heap-trim threshold, glass-off ceiling |
+
+Every option is a proper control — `GtkSwitch` for booleans, `GtkSpinButton`
+for numbers, `GtkEntry` for text, `GtkDropDown` for enums — with tooltips
+(help text) on hover.
+
+### Save & live reload
+
+**Save** rewrites the file **textually**: comments, indentation and every key
+you didn't touch survive exactly as they were. The pinned-apps list is written
+both to `config.toml` and to `~/.cache/dockh/pinned` (the dock's runtime
+truth). **Reload** discards unsaved edits and re-reads the file from disk.
+
+Because the dock watches `config.toml`, **saving applies immediately** — the
+dock re-executes itself and every change (even position/layer/glass) takes
+effect live.
 
 ### Available CSS classes
 
@@ -438,7 +646,8 @@ ignored.
   the current workspace and `.inactive` otherwise), `.dockh-glow` (blur halo
   of the active icon),
   `.dockh-progress` (media progress bar), `.dockh-badge` (notification
-  counter), `.dockh-separator`, `.dockh-menu*`, and the ids
+  counter), `.dockh-sys` (the RAM/CPU/temp monitor pill), `.dockh-separator`,
+  `.dockh-menu*`, and the ids
   `#dockh-window`, `#dockh-box`, `#dockh-hotspot-window`.
 
   > 🔍 **CSS breaking change (0.2.0)**: the old single-dot indicator classes
@@ -488,6 +697,17 @@ steps = 256                # bucket ladder size: 256 = sub-pixel steps, continuo
 duration_ms = 40           # exponential ease constant in ms (higher = smoother)
 spring = true              # macOS settle bounce: tiny damped overshoot when the pointer stops
 spring_strength = 0.06     # bounce amplitude, fraction of each icon's scale (0-0.25)
+# macOS click spring: pressing an icon squashes it down, releasing springs it
+# back with a pronounced overshoot (the dock's "launch bounce").
+click_spring = true        # enable the press/release bounce on click
+press_strength = 0.12      # squash depth on press, fraction of scale (0-0.30)
+release_strength = 0.22    # overshoot on release, fraction of scale (0-0.50)
+# macOS ghost launch: clicking a pinned app that ISN'T running makes the
+# icon bounce up and fade out toward the app that opens (like the real
+# dock) — the openwindow event then replaces it with the running icon.
+ghost_launch = true        # enable the launch bounce+fade
+ghost_ms = 600             # fade duration in ms
+ghost_scale = 1.35         # peak scale while fading (1.0 = no growth)
 ```
 
 > 🔍 **Why `steps = 256`?** The classic mistake is a coarse ladder (e.g. 32
@@ -515,6 +735,52 @@ entirely and the icons simply stop.
 > phase-shifts the target oscillation, so the perceived bounce is a little
 > softer than the raw knob. Raise `spring_strength` (e.g. 0.08–0.10) if you
 > want the settle to read more clearly.
+
+### The macOS click spring (press/release) 🖱️
+
+On top of the settle bounce, **clicking** an icon plays the real dock's
+"launch bounce": press squashes the icon down briefly, release springs it
+back with a **pronounced overshoot** (much bigger than the settle — default
+22% of the icon's scale, vs 6%). Both phases run in the same per-frame code
+tick, applied **only to the clicked icon** (matched by widget pointer, so
+far icons stay put), and they work even when the icon isn't magnified (the
+rest scale 1.0 still dips and bounces). The press uses a stiffer, faster
+spring (~280 ms dip); the release reuses the settle's ζ/ω shape with a
+larger amplitude (~550 ms).
+
+```toml
+[magnify]
+click_spring = true        # enable press/release bounce on click
+press_strength = 0.12      # squash depth on press, fraction of scale (0-0.30)
+release_strength = 0.22    # overshoot on release, fraction of scale (0-0.50)
+```
+
+> 🔍 `press_strength = 0` disables the press dip, `release_strength = 0` the
+> release bounce; `click_spring = false` removes the whole effect. The ladder
+> headroom (SPRING_HEADROOM, 30% above `animation.scale`) was raised so the
+> release overshoot of a fully-magnified icon never clips at the ladder top.
+
+### The macOS ghost launch 👻
+
+Clicking a **pinned app that isn't running** doesn't just launch it — the
+icon performs a *ghost launch* like the real dock: it swells up to
+`ghost_scale` (1.35× by default) and **fades to transparent** over
+`ghost_ms`, as if the icon itself flies into the app window that's opening.
+When Hyprland's `openwindow` event lands, the dock rebuilds and the ghost
+is replaced by the live running icon (with its indicator dots). If the app
+is slow to open, the icon fades back in instead of staying invisible.
+
+```toml
+[magnify]
+ghost_launch = true        # enable the launch bounce+fade
+ghost_ms = 600             # fade duration in ms (150-2000)
+ghost_scale = 1.35         # peak scale while fading (1.0 = no growth)
+```
+
+It runs in the same per-frame code tick as the springs (a smooth ease-in-out
+pulse — `1.0 → ghost_scale → 1.0` — combined with an opacity fade), so there
+is no CSS transition and nothing to stutter. `ghost_launch = false` or
+`ghost_ms = 0` disables it (the app just launches normally).
 
 The `duration_ms` is the exponential ease constant: 25–50 ms feels like macOS
 (fast, responsive), higher values float. The `[animation]` values are injected
@@ -606,12 +872,51 @@ bind = SUPER, D, exec, pkill -RTMIN+1 dockh
 - Build in `ReleaseFast` (already the default of `install.sh` and `make
   build`): a `Debug` build (plain `zig build` without flags) retains much
   more. Verify with `file $(which dockh)` → it should say `stripped`.
-- dockh calls `malloc_trim(0)` periodically (5 s, then every 30 s) to return
-  to the OS the pages GTK4 frees when rebuilding the dock — without it the
-  RSS stays at the peak (~200 MB instead of ~75 MB).
+- dockh calls `malloc_trim(0)` periodically (15 s, plus one early trim at
+  5 s) to return to the OS the pages GTK4 frees when rebuilding the dock —
+  without it the RSS stays at the peak.
+- **The RSS watchdog (`[memory]`)** — dockh samples its own RSS every
+  `watch_sec` seconds and guarantees it never blows up:
+
+  ```toml
+  [memory]
+  watch_sec = 5          # how often to check the RSS (s)
+  trim_above_mb = 165    # force malloc_trim above this RSS (MiB)
+  glass_off_mb = 210     # drop the liquid-glass shader above this RSS (MiB)
+  ```
+
+  - Above `trim_above_mb` the heap is returned to the OS immediately.
+  - Above `glass_off_mb` (the **hard ceiling**) dockh drops the GLSL glass
+    panel and falls back to the pure-CSS glass — freeing the Mesa/GL
+    context. Set `0` to disable a threshold.
+- The GLSL glass panel reserves a Mesa/GL context (~+70-90 MB RSS, stable —
+  it does **not** grow; most of it is shared library pages, the dock's own
+  private memory is only ~11 MB). If you prefer the lighter CSS glass, set
+  `glass.enabled = false` in `config.toml` (~75 MB), or rely on
+  `glass_off_mb` to do it automatically under pressure.
 - The `bottom` layer (default) doesn't reserve an exclusive zone, so apps
   cover it and you don't waste screen space; the base GTK4+GSK footprint is
   inherent (~70-80 MB in `ReleaseFast`).
+
+### The glass panel is not rendering (icons on a plain background)
+
+- The shader needs `grim` (for the background capture) and a GL 3.3 context.
+  Install: `sudo pacman -S grim mesa` (gl).
+- Check the log with `dockh -debug`: `glass shader:` / `glass link:` lines
+  mean the GLSL failed to compile (e.g. old GPU); `glass: no GL context`
+  means no OpenGL; `glass: grim unavailable` means grim is missing. In every
+  case dockh falls back to the CSS glass — it never crashes.
+- The panel only shows where the dock is visible; `layer = "bottom"` keeps it
+  behind windows (expected).
+- `.glass-on` is added to `#dockh-window` only when the GL pipeline works.
+  If you customized `style.css`, keep the `#dockh-window.glass-on #dockh-box`
+  override rule so the CSS chrome doesn't double-draw over the shader.
+
+### The dock shimmers / flickers on workspace change
+
+- The background texture is re-captured on workspace changes: the dock hides
+  briefly (~150 ms) so grim captures a clean desktop. That's by design — if
+  it bothers you, `glass.enabled = false` keeps a static CSS glass.
 
 ### I have multiple monitors and the dock is on the wrong one
 
@@ -646,6 +951,7 @@ src/
 ├── ui/
 │   ├── widgets.zig     # buttons, indicators, GTK4 popovers, progress + badges
 │   ├── blur.zig        # in-dock blur in the scene graph (GskBlurNode/GLShader)
+│   ├── glass.zig       # GLSL liquid glass: GtkGLArea shader + grim capture
 │   ├── status.zig      # playerctl/makoctl polling (GSubprocess)
 │   └── theme.zig       # GtkCssProvider + injected animations + hot reload
 └── defaults/           # embedded config.toml and style.css (first run)
@@ -677,8 +983,22 @@ are hand-declared in `c.zig` (direct C ABI, no GC).
 - [x] `style.css` hot reload (GFileMonitor + debounce)
 - [x] Packaging: `install.sh`, `Makefile`, AUR `PKGBUILD`
 - [x] In-dock blur with `GskGLShaderNode` + automatic `GskBlurNode` fallback
+- [x] Real GLSL liquid-glass panel (GtkGLArea + grim capture, configurable)
 - [x] Media progress bar (playerctl) + notification counter (makoctl)
 - [x] Per-workspace indicators (macOS style) — dots spread with the magnify
+- [x] **`dockh-config` — GUI configuration window** (GTK4): a pretty settings
+  panel that edits `config.toml` for you, instead of hand-editing TOML:
+  - Appearance: icon size, margins, position, alignment, layer, animation
+    scale/duration/curve, magnify spread/steps, spring & click-spring tuning
+  - Behavior: autohide + hotspot delay, intellihide, resident, full width
+  - Widgets: notification badge on/off + threshold, progress bar, glow radius
+  - Glass: enable/disable + refraction/frost/dispersion/depth/light/alpha,
+    presets (Light/Frost/Spray/Liquid/Deep) and a live Cairo preview
+  - Apps: pin/unpin your favorites visually, manage ignore lists
+  - Memory: watchdog thresholds (`watch_sec`, `trim_above_mb`, `glass_off_mb`)
+  - Live preview: changes apply instantly (config hot-reload), with a reset
+    to defaults button
+  - Accessible from the dock: right-click any icon → **Configuration…**
 - [ ] Publish to the AUR
 
 ---

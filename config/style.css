@@ -18,8 +18,8 @@
 @define-color accent_soft     rgba(138, 180, 255, 0.35);
 @define-color fg              #e8eaf0;
 @define-color fg_dim         rgba(232, 234, 240, 0.55);
-@define-color indicator_idle  rgba(232, 234, 240, 0.22);
-@define-color indicator_run   rgba(232, 234, 240, 0.65);
+@define-color indicator_idle  rgba(255, 255, 255, 0.25);
+@define-color indicator_run   rgba(255, 255, 255, 0.55);
 
 /* ------------------------------------------------------------------ */
 /* Window: fully transparent; the box provides the visible chrome.    */
@@ -30,17 +30,29 @@
     box-shadow: none;
 }
 
+/* When the real GLSL liquid-glass panel is active (glass.zig renders the
+   SDF/refraction/frost behind the icons), the CSS box chrome must step aside
+   — otherwise it would double-draw on top of the shader. The .glass-on class
+   is added to #dockh-window by glass.zig only when the GL pipeline works. */
+#dockh-window.glass-on #dockh-box {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+}
+
 /* ------------------------------------------------------------------ */
 /* Dock chrome: floating liquid-glass panel.                          */
 /* ------------------------------------------------------------------ */
 
 #dockh-box {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.03)),
-                linear-gradient(180deg, rgba(44, 48, 62, 0.58), rgba(18, 20, 28, 0.52));
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    border-radius: 22px;
-    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.14);
-    padding: 6px;
+    /* macOS-style material: dark translucent glass with a faint top sheen.
+       The compositor blur (layerrule) provides the frost behind it. */
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02)),
+                linear-gradient(180deg, rgba(30, 33, 44, 0.62), rgba(14, 16, 24, 0.58));
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 26px;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.50), inset 0 1px 0 rgba(255, 255, 255, 0.10), inset 0 -1px 0 rgba(0, 0, 0, 0.20);
+    padding: 8px;
     margin: 8px;
 }
 
@@ -52,16 +64,16 @@
 
 .dockh-item {
     background-color: transparent;
-    padding: 3px;
+    padding: 4px;
 }
 
 .dockh-btn {
     background-color: transparent;
     background-image: none;
     border: none;
-    border-radius: 14px;
+    border-radius: 16px;
     box-shadow: none;
-    padding: 3px;
+    padding: 4px;
     min-width: 0;
     min-height: 0;
     color: @fg;
@@ -69,16 +81,21 @@
 }
 
 .dockh-btn image {
-    -gtk-icon-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    -gtk-icon-shadow: none;
 }
 
+/* No hover highlight: the icon only lifts via the magnify proximity
+   animation (driven in code by the frame clock). The button stays clean
+   glass — exactly like macOS, no background change on hover. */
 .dockh-btn:hover {
-    background-color: rgba(255, 255, 255, 0.12);
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+    background-color: transparent;
+    box-shadow: none;
 }
 
+/* Press: subtle accent tint + thin ring, macOS-like. */
 .dockh-btn:active {
-    background-color: rgba(138, 180, 255, 0.18);
+    background-color: rgba(138, 180, 255, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(138, 180, 255, 0.28);
 }
 
 /* The scale/translate/rotate hover animation is injected from config.toml
@@ -91,7 +108,8 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-glow {
-    opacity: 0.85;
+    opacity: 0.8;
+    transition: opacity 250ms ease;
 }
 
 /* ------------------------------------------------------------------ */
@@ -160,13 +178,11 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-launcher .dockh-btn {
-    background-color: rgba(138, 180, 255, 0.12);
-    box-shadow: inset 0 0 0 1px rgba(138, 180, 255, 0.22);
+    background-color: rgba(138, 180, 255, 0.10);
+    box-shadow: inset 0 0 0 1px rgba(138, 180, 255, 0.18);
 }
 
-.dockh-launcher .dockh-btn:hover {
-    background-color: rgba(138, 180, 255, 0.24);
-}
+/* Hover on the launcher is a no-op too — only the magnify scales it. */
 
 /* Launcher never runs: no indicator dot. */
 .dockh-launcher .dockh-indicator {
@@ -182,18 +198,22 @@
 /*   .dockh-app-<class>   — per-app, e.g. .dockh-app-alacritty         */
 /* ------------------------------------------------------------------ */
 
+/* Active app: clean accent ring, no outer glow — the workspace dots + glow
+   halo already mark focus. */
 .dockh-item.active .dockh-btn {
-    background-color: rgba(138, 180, 255, 0.16);
-    box-shadow: inset 0 0 0 1px rgba(138, 180, 255, 0.35), 0 0 12px rgba(138, 180, 255, 0.18);
+    background-color: rgba(138, 180, 255, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(138, 180, 255, 0.32);
 }
 
 .dockh-item.running .dockh-btn {
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
+/* No hover highlight even on active/running — the magnify scale is the
+   only hover feedback, like the macOS dock. */
 .dockh-item.active .dockh-btn:hover,
 .dockh-item.running .dockh-btn:hover {
-    background-color: rgba(255, 255, 255, 0.12);
+    background-color: transparent;
 }
 
 /* Pinned apps that aren't running: no opacity fade — icons keep their
@@ -208,11 +228,11 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-separator {
-    background-color: rgba(255, 255, 255, 0.10);
+    background-color: rgba(255, 255, 255, 0.08);
     min-width: 1px;
     min-height: 1px;
     border-radius: 1px;
-    margin: 2px 8px;
+    margin: 6px 10px;
 }
 
 /* ------------------------------------------------------------------ */
@@ -243,8 +263,8 @@
 }
 
 .dockh-wsdot.active {
-    background-color: @accent;
-    box-shadow: 0 0 8px @accent_soft;
+    background-color: #ffffff;
+    box-shadow: 0 0 6px rgba(255, 255, 255, 0.55);
 }
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +300,28 @@
 /* ------------------------------------------------------------------ */
 /* Hotspot windows: invisible except a whisper of the strip.          */
 /* ------------------------------------------------------------------ */
+
+/* Optional system monitor (RAM / CPU / temperature). By default it lives
+   in the RIGHT-CLICK context menu of every dock item (live, updated every
+   [system].interval_ms); `[system] dock = true` additionally shows it as a
+   compact pill at the end of the dock. */
+.dockh-sys {
+    font-size: 11px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.85);
+    padding: 2px 10px;
+    margin: 0 4px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+/* Inside a context menu the pill chrome is redundant — plain reading text,
+   aligned with the menu title. */
+.dockh-menu .dockh-sys {
+    background-color: transparent;
+    padding: 2px 8px;
+    margin: 0;
+}
 
 #dockh-hotspot-window {
     background-color: transparent;

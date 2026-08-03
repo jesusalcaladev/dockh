@@ -4,12 +4,13 @@
 //! Hyprland layerrule blur, and the container keeps fixed dimensions while
 //! buttons get `transform: scale()` transitions (no layout jitter).
 const std = @import("std");
-const c = @import("../c.zig");
+const c = @import("c"); // named module (build.zig)
 const config_mod = @import("../core/config.zig");
 const state = @import("../core/state.zig");
 const hypr = @import("../hypr/ipc.zig");
 const desktop = @import("../hypr/desktop.zig");
 const blur = @import("blur.zig");
+const glass = @import("glass.zig");
 const main_mod = @import("../main.zig");
 const log = @import("../core/log.zig");
 
@@ -26,6 +27,12 @@ const BtnData = struct {
 /// so repeated clicks would leak entire popover trees. Track them and destroy
 /// when replacing. `nested_popover` is the "move to workspace" menu that lives
 /// inside the context menu (it must not dismiss its parent).
+///
+/// CRITICAL: GTK destroys popovers on its own — autohide when the user clicks
+/// outside, Escape, or the anchor being torn down during a dock rebuild. Every
+/// popover gets a `destroy` handler (trackPopover) that nulls whichever global
+/// points at it, so the next dismissPopover can never unref freed memory (the
+/// `g_object_unref: G_IS_OBJECT` assertion the dock used to crash with).
 var current_popover: ?*anyopaque = null;
 var nested_popover: ?*anyopaque = null;
 
@@ -43,6 +50,25 @@ const ItemStatus = struct {
 };
 
 var item_status: std.ArrayList(ItemStatus) = .empty;
+
+/// The optional system monitor (RAM / CPU / temp) has TWO possible homes:
+///
+///  * `sys_label` — the always-visible pill at the end of the dock, but ONLY
+///    when `[system] dock = true` (opt-in: constant stats in a dock are
+///    noise — the context menu is the good UX). Recreated on every rebuild,
+///    wiped in clearBox.
+///  * `sys_menu_label` — the live "System" section at the bottom of the
+///    right-click context menu, updated by the same pollSystem timer while
+///    the popover is open. Created per popover, cleared when dismissed.
+///
+/// setSystemText/setSystemVisible write to whichever is currently alive.
+var sys_label: ?*anyopaque = null;
+var sys_menu_label: ?*anyopaque = null;
+/// The popover that owns sys_menu_label — when THAT popover is destroyed (by
+/// us or by GTK), the label dies with its tree, so both pointers must clear
+/// together. Other popovers (e.g. the nested "move to workspace" menu) have
+/// no system section and must not clobber it.
+var sys_menu_pop: ?*anyopaque = null;
 
 /// Set the media-progress fraction (0 hides the bar) for one app class.
 /// An empty `class` (no player) hides every progress bar.
@@ -166,10 +192,43 @@ const SPRING_MAX_S: f64 = 0.55; // the bounce is done after ~550 ms
 // theme.zig's ladder) — see config_mod.SPRING_HEADROOM below.
 const SPRING_HEADROOM = config_mod.SPRING_HEADROOM;
 
+// macOS click spring: pressing an icon squashes it down briefly (a quick
+// dip), and releasing springs it back with a PRONOUNCED overshoot — like the
+// real dock when you click an app. Both phases are integrated in the same
+// per-frame tick as the settle spring, applied only to the CLICKED icon
+// (matched by widget pointer, so far icons stay put). The press dip uses a
+// stiffer, faster spring; the release bounce uses the same ζ/ω shape as the
+// settle spring but with a much larger amplitude.
+const PRESS_ZETA: f64 = 0.7; // quick dip: less overshoot, snappier
+const PRESS_OMEGA: f64 = 40.0; // faster oscillation (~6.4 Hz)
+const PRESS_MAX_S: f64 = 0.28; // dip is done after ~280 ms
+const RELEASE_ZETA: f64 = 0.6; // same damping as the settle spring
+const RELEASE_OMEGA: f64 = 30.0; // same frequency as the settle spring
+const RELEASE_MAX_S: f64 = 0.55; // bounce is done after ~550 ms
+
 var spring_active = false; // pointer idle -> a settle bounce is running
 var spring_t: f64 = 0; // seconds since the bounce started
 var spring_fired = false; // one bounce per idle period (no re-trigger loop)
 var mag_last_move_us: i64 = 0; // monotonic µs of the last pointer move
+
+// click spring state: the widget that was pressed/released and its phase
+var press_widget: ?*anyopaque = null;
+var press_active = false;
+var press_t: f64 = 0;
+var release_widget: ?*anyopaque = null;
+var release_active = false;
+var release_t: f64 = 0;
+
+// macOS ghost launch: clicking a pinned app that ISN'T running bounces the
+// icon and fades it out toward the app that opens — the "ghost" flying into
+// the launch, like the real dock. The clicked icon scales up to
+// ghost_scale and its opacity drops to 0 over ghost_ms, driven in the same
+// frame-clock tick; when the app's openwindow event lands, the rebuild
+// replaces the ghost with the live running icon.
+var ghost_widget: ?*anyopaque = null;
+var ghost_active = false;
+var ghost_t: f64 = 0;
+var ghost_dur: f64 = 0.6; // seconds, from config at trigger time
 
 /// Monotonic microseconds (CLOCK_MONOTONIC) — used to detect that the
 /// pointer stopped moving over the dock (idle), which triggers the spring.
@@ -181,14 +240,14 @@ fn monoUs() i64 {
 
 fn registerMagItem(w: ?*anyopaque) void {
     if (!state.cfg.magnify_enabled) return;
-    mag_items.append(state.alloc, .{ .widget = w }) catch {};
+    mag_items.append(state.ui_alloc, .{ .widget = w }) catch {};
 }
 
 /// Register a magnify entry whose `linked` widget (the workspace dot row)
 /// mirrors the icon's bucket, so the dots spread in sync with the icon.
 fn registerMagItemLinked(w: ?*anyopaque, linked: ?*anyopaque) void {
     if (!state.cfg.magnify_enabled) return;
-    mag_items.append(state.alloc, .{ .widget = w, .linked = linked }) catch {};
+    mag_items.append(state.ui_alloc, .{ .widget = w, .linked = linked }) catch {};
 }
 
 /// Cursor distance (in icon slots) -> continuous scale position [0..steps-1].
@@ -254,11 +313,12 @@ fn magFrame(dt: f64) bool {
     // tau = magnify_duration_ms (the "feel" constant, like macOS).
     const tau_ms: f64 = @floatFromInt(@max(state.cfg.magnify_duration_ms, 8));
     const alpha = 1.0 - @exp(-(dt * 1000.0) / tau_ms);
-    // The tick must stay alive while the pointer is inside — hoisted OUT of
-    // the loop so a translate_coordinates failure (widgets not yet realized
-    // right after a rebuild) can never kill it and freeze the magnify until
-    // the next motion event re-arms it.
-    var moving = mag_inside;
+    // The tick must stay alive while the pointer is inside OR a click spring
+    // phase is still running — hoisted OUT of the loop so a
+    // translate_coordinates failure (widgets not yet realized right after a
+    // rebuild) can never kill it and freeze the animation until the next
+    // motion event re-arms it.
+    var moving = mag_inside or press_active or release_active or ghost_active;
 
     // macOS settle spring: while the pointer is inside and stops moving
     // (idle > SPRING_IDLE_MS), each icon completes its motion with one tiny
@@ -301,6 +361,26 @@ fn magFrame(dt: f64) bool {
             spring_k = 1.0 + (state.cfg.magnify_spring_strength / peak) * env;
         }
     }
+    // click spring: advance both phases once per frame
+    if (press_active) {
+        press_t += dt;
+        if (press_t >= PRESS_MAX_S) press_active = false;
+    }
+    if (release_active) {
+        release_t += dt;
+        if (release_t >= RELEASE_MAX_S) release_active = false;
+    }
+    // macOS ghost launch: advance the phase; when it ends restore the icon
+    // (the openwindow event usually rebuilds and replaces it before then, but
+    // a slow launch leaves the ghost faded — bring it back so it's not stuck).
+    if (ghost_active) {
+        ghost_t += dt;
+        if (ghost_t >= ghost_dur) {
+            ghost_active = false;
+            if (ghost_widget) |gw| c.gtk_widget_set_opacity(gw, 1.0);
+            ghost_widget = null;
+        }
+    }
 
     for (mag_items.items) |*item| {
         const w = item.widget orelse continue;
@@ -328,12 +408,47 @@ fn magFrame(dt: f64) bool {
         // Apply the spring in SCALE space to the magnify delta only: distant
         // icons (rest scale ~ 1.0) stay put, and the peak icon overshoots by
         // `spring_strength` of its own magnification into the ladder's
-        // headroom (theme.zig extends 15% above animation.scale) — so the
+        // headroom (theme.zig extends 30% above animation.scale) — so the
         // bounce is visible on the icon under the cursor, exactly like macOS.
         if (spring_active) {
             const rest_scale = 1.0 + (target / maxb) * (top_scale - 1.0);
             const scale_spring = 1.0 + (rest_scale - 1.0) * spring_k;
             target = (scale_spring - 1.0) / (top_scale - 1.0) * maxb;
+        }
+        // Click spring: applied to the CLICKED icon only, in full scale space
+        // (rest 1.0 included), so even an unmagnified icon squashes and
+        // bounces. Press dips below 1.0 (squash); release overshoots above
+        // (macOS launch bounce).
+        if (press_active and item.widget == press_widget) {
+            const rest_scale = 1.0 + (target / maxb) * (top_scale - 1.0);
+            const press_k = 1.0 - state.cfg.magnify_press_strength *
+                @sin(std.math.pi * @min(press_t / PRESS_MAX_S, 1.0));
+            target = (rest_scale * press_k - 1.0) / (top_scale - 1.0) * maxb;
+        }
+        if (release_active and item.widget == release_widget) {
+            const rest_scale = 1.0 + (target / maxb) * (top_scale - 1.0);
+            const wd = RELEASE_OMEGA * @sqrt(1.0 - RELEASE_ZETA * RELEASE_ZETA);
+            const a = RELEASE_ZETA * RELEASE_OMEGA;
+            const t_peak = std.math.atan(wd / a) / wd;
+            const peak = @exp(-a * t_peak) * @sin(wd * t_peak);
+            const env = @exp(-a * release_t) * @sin(wd * release_t);
+            const release_k = 1.0 + (state.cfg.magnify_release_strength / peak) * env;
+            target = (rest_scale * release_k - 1.0) / (top_scale - 1.0) * maxb;
+        }
+        // macOS ghost launch: the clicked ghost pin scales up to ghost_scale
+        // (a smooth rise-and-fall envelope, clipped to the ladder) while its
+        // opacity drops to 0 — the icon "flies" into the app that's opening.
+        // The envelope is an ease-in-out pulse so the growth feels springy,
+        // not linear; opacity fades in the second half for the ghost effect.
+        if (ghost_active and item.widget == ghost_widget) {
+            const p = @min(ghost_t / ghost_dur, 1.0);
+            const pulse = 0.5 - 0.5 * @cos(std.math.pi * p); // 0 -> 1 -> eased
+            const ghost_target_scale = 1.0 + (state.cfg.magnify_ghost_scale - 1.0) * pulse;
+            const rest_scale = 1.0 + (target / maxb) * (top_scale - 1.0);
+            const combined = @min(rest_scale * ghost_target_scale, top_scale);
+            target = (combined - 1.0) / (top_scale - 1.0) * maxb;
+            const opacity = 1.0 - pulse * pulse;
+            c.gtk_widget_set_opacity(w, opacity);
         }
         item.scale += (target - item.scale) * alpha;
         var b: usize = @intFromFloat(@round(item.scale));
@@ -426,7 +541,20 @@ pub fn resetMagnifyState() void {
     spring_active = false;
     spring_t = 0;
     spring_fired = false;
+    press_widget = null;
+    press_active = false;
+    press_t = 0;
+    release_widget = null;
+    release_active = false;
+    release_t = 0;
     mag_last_move_us = 0;
+    // ghost launch: cancel any in-flight fade and restore the icon — the old
+    // widget tree is being torn down, but the ghost pin may survive a rebuild
+    // (e.g. the app is still opening), so it must not stay invisible.
+    ghost_active = false;
+    ghost_t = 0;
+    if (ghost_widget) |gw| c.gtk_widget_set_opacity(gw, 1.0);
+    ghost_widget = null;
     stopMagTick();
     last_tick_us = 0;
     for (mag_items.items) |*item| {
@@ -454,7 +582,15 @@ fn makeImage(alloc: std.mem.Allocator, id: []const u8, size: i32) ?*anyopaque {
     const theme = c.gtk_icon_theme_get_for_display(display);
     const z = alloc.dupeZ(u8, id) catch return null;
     defer alloc.free(z);
-    const paintable = c.gtk_icon_theme_lookup_icon(theme, z.ptr, null, size, 1, 0, c.ICON_LOOKUP_NONE);
+    // Request the icon from the theme at a HIGHER resolution than it is
+    // displayed (icon_size x magnify peak). GtkImage then downscales the
+    // bigger source to pixel_size — a smooth, crisp 32px render at rest — and
+    // when the CSS magnify transform scales the button up, GSK interpolates
+    // from that high-quality render instead of a barely-32px texture (the
+    // "pixelated" look).
+    const anim_scale: f64 = @max(state.cfg.animation_scale, 1.0);
+    const lookup_size: i32 = @intFromFloat(@ceil(@as(f64, @floatFromInt(size)) * anim_scale));
+    const paintable = c.gtk_icon_theme_lookup_icon(theme, z.ptr, null, lookup_size, 1, 0, c.ICON_LOOKUP_NONE);
     if (paintable == null) return null;
     const img = c.gtk_image_new_from_paintable(paintable);
     c.gtk_image_set_pixel_size(img, size);
@@ -470,7 +606,8 @@ fn fallbackImage(alloc: std.mem.Allocator, size: i32) ?*anyopaque {
 }
 
 fn cString(s: []const u8) [:0]const u8 {
-    return state.alloc.dupeZ(u8, s) catch "";
+    // Transient label/tooltip strings live in the per-rebuild arena.
+    return state.ui_alloc.dupeZ(u8, s) catch "";
 }
 
 /// `Alacritty` + `dockh-app-` -> `dockh-app-alacritty` — a stable, CSS-safe
@@ -597,7 +734,9 @@ fn popoverPosition() c.GtkPositionType {
 }
 
 /// Pop down, unparent and release our reference. We always hold the ref from
-/// gtk_popover_new, so the pointer stays valid until we unref it.
+/// gtk_popover_new, so the pointer stays valid until we unref it — as long as
+/// the `destroy` tracking (trackPopover) kept the globals in sync, so we never
+/// dismiss an object GTK already freed.
 fn dismissPopover(pop: ?*anyopaque) void {
     if (pop) |p| {
         c.gtk_popover_popdown(p);
@@ -606,11 +745,41 @@ fn dismissPopover(pop: ?*anyopaque) void {
     }
 }
 
+/// GTK called destroy on a popover WE created — either our own dismiss or GTK
+/// freeing it behind our back (autohide / anchor teardown). Null every global
+/// that pointed at it so nothing ever dismisses freed memory twice.
+fn onPopoverDestroyed(widget: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const p = widget orelse return;
+    if (current_popover == p) current_popover = null;
+    if (nested_popover == p) nested_popover = null;
+    if (sys_menu_pop == p) {
+        sys_menu_pop = null;
+        sys_menu_label = null; // the label was a child of this popover's tree
+    }
+}
+
+/// Connect the destroy tracking to a freshly created popover.
+fn trackPopover(pop: ?*anyopaque) void {
+    if (pop) |p| {
+        _ = c.g_signal_connect(p, "destroy", @ptrCast(&onPopoverDestroyed), null);
+    }
+}
+
+/// Dismiss both open popovers, null-first: the globals are cleared BEFORE the
+/// destroy calls so a re-entrant destroy callback can never double-dismiss.
+///
+/// NOTE: sys_menu_label/sys_menu_pop are NOT nulled here — appendSystemMenuSection
+/// runs before popupAt() (which calls this), so clearing them here would clobber
+/// the freshly-registered label of the popover being OPENED and the live System
+/// section would never update. Cleanup belongs to onPopoverDestroyed, which
+/// nulls them only when the dying popover is the one that owns the label.
 fn dismissCurrentPopover() void {
-    dismissPopover(nested_popover);
+    const n = nested_popover;
     nested_popover = null;
-    dismissPopover(current_popover);
+    const c_cur = current_popover;
     current_popover = null;
+    dismissPopover(n);
+    dismissPopover(c_cur);
 }
 
 fn popupAt(popover: ?*anyopaque, anchor: ?*anyopaque) void {
@@ -634,24 +803,25 @@ const SwitchData = struct { address: []const u8 = "" };
 
 fn onSwitchFocus(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *SwitchData = @ptrCast(@alignCast(ud.?));
-    hypr.focusWindow(&state.ctx, state.alloc, d.address);
+    hypr.focusWindow(&state.ctx, state.ui_alloc, d.address);
 }
 
 fn instancePopover(anchor: ?*anyopaque, class: []const u8, instances: []const hypr.Client) ?*anyopaque {
     const pop = c.gtk_popover_new();
+    trackPopover(pop);
     const vbox = c.gtk_box_new(c.ORIENTATION_VERTICAL, 2);
     c.gtk_widget_add_css_class(vbox, "dockh-menu");
 
-    const header = c.gtk_label_new(cString(desktop.getAppName(state.alloc, class)));
+    const header = c.gtk_label_new(cString(desktop.getAppName(state.ui_alloc, class)));
     c.gtk_widget_add_css_class(header, "dockh-menu-title");
     c.gtk_box_append(vbox, header);
 
     for (instances) |inst| {
-        const title_perm = state.alloc.dupe(u8, if (inst.title.len > 30) inst.title[0..30] else inst.title) catch continue;
-        const ws_perm = state.alloc.dupe(u8, inst.workspace.name) catch continue;
-        const label = std.fmt.allocPrint(state.alloc, "{s}  ({s})", .{ title_perm, ws_perm }) catch title_perm;
-        const d: *SwitchData = state.alloc.create(SwitchData) catch continue;
-        d.* = .{ .address = state.alloc.dupe(u8, inst.address) catch continue };
+        const title_perm = state.ui_alloc.dupe(u8, if (inst.title.len > 30) inst.title[0..30] else inst.title) catch continue;
+        const ws_perm = state.ui_alloc.dupe(u8, inst.workspace.name) catch continue;
+        const label = std.fmt.allocPrint(state.ui_alloc, "{s}  ({s})", .{ title_perm, ws_perm }) catch title_perm;
+        const d: *SwitchData = state.ui_alloc.create(SwitchData) catch continue;
+        d.* = .{ .address = state.ui_alloc.dupe(u8, inst.address) catch continue };
         const btn = menuRowButton(label, onSwitchFocus, d);
         c.gtk_box_append(vbox, btn);
     }
@@ -669,49 +839,53 @@ const MoveData = struct { address: []const u8 = "", ws: i32 = 1 };
 
 fn onCtxFocus(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *CtxData = @ptrCast(@alignCast(ud.?));
-    hypr.focusWindow(&state.ctx, state.alloc, d.address);
+    hypr.focusWindow(&state.ctx, state.ui_alloc, d.address);
 }
 
 fn onCtxClose(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *CtxData = @ptrCast(@alignCast(ud.?));
-    hypr.closeWindow(&state.ctx, state.alloc, d.address);
+    hypr.closeWindow(&state.ctx, state.ui_alloc, d.address);
     hideIfAutohide();
 }
 
 fn onCtxFloat(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *CtxData = @ptrCast(@alignCast(ud.?));
-    hypr.toggleFloating(&state.ctx, state.alloc, d.address);
-    hypr.focusWindow(&state.ctx, state.alloc, d.address);
+    hypr.toggleFloating(&state.ctx, state.ui_alloc, d.address);
+    hypr.focusWindow(&state.ctx, state.ui_alloc, d.address);
 }
 
 fn onCtxFullscreen(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *CtxData = @ptrCast(@alignCast(ud.?));
-    hypr.toggleFullscreen(&state.ctx, state.alloc, d.address);
-    hypr.focusWindow(&state.ctx, state.alloc, d.address);
+    hypr.toggleFullscreen(&state.ctx, state.ui_alloc, d.address);
+    hypr.focusWindow(&state.ctx, state.ui_alloc, d.address);
 }
 
 fn onCtxMove(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *MoveData = @ptrCast(@alignCast(ud.?));
-    hypr.moveToWorkspace(&state.ctx, state.alloc, d.address, d.ws);
+    hypr.moveToWorkspace(&state.ctx, state.ui_alloc, d.address, d.ws);
 }
 
 fn onMovePopover(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const ma: *MoveAnchor = @ptrCast(@alignCast(ud.?));
     const pop = c.gtk_popover_new();
+    trackPopover(pop);
     const vbox = c.gtk_box_new(c.ORIENTATION_VERTICAL, 2);
     c.gtk_widget_add_css_class(vbox, "dockh-menu");
     var ws: i32 = 1;
     while (ws <= state.cfg.num_workspaces) : (ws += 1) {
-        const md: *MoveData = state.alloc.create(MoveData) catch return;
+        const md: *MoveData = state.ui_alloc.create(MoveData) catch return;
         md.* = .{ .address = ma.address, .ws = ws };
-        const label = std.fmt.allocPrint(state.alloc, "Workspace {d}", .{ws}) catch continue;
+        const label = std.fmt.allocPrint(state.ui_alloc, "Workspace {d}", .{ws}) catch continue;
         const btn = menuRowButton(label, onCtxMove, md);
         c.gtk_box_append(vbox, btn);
     }
     c.gtk_popover_set_child(pop, vbox);
     const anchor = ma.button orelse return;
     // Nested menu: don't dismiss the context popover that contains `anchor`.
-    dismissPopover(nested_popover);
+    // Null-first so a re-entrant destroy callback can't double-dismiss.
+    const old_nested = nested_popover;
+    nested_popover = null;
+    dismissPopover(old_nested);
     c.gtk_widget_set_parent(pop, anchor);
     c.gtk_popover_set_position(pop, popoverPosition());
     c.gtk_popover_popup(pop);
@@ -720,13 +894,38 @@ fn onMovePopover(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
 
 fn onCtxLaunch(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *CtxData = @ptrCast(@alignCast(ud.?));
-    _ = desktop.launch(state.alloc, d.class);
+    _ = desktop.launch(state.ui_alloc, d.class);
     hideIfAutohide();
 }
 
 fn onCtxPin(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
     const d: *CtxData = @ptrCast(@alignCast(ud.?));
     pinUnpin(d.class);
+}
+
+/// Launch the graphical config editor (dockh-config). Prefer the sibling
+/// binary sitting next to dockh's own executable (readlink /proc/self/exe),
+/// so the menu item works even when PATH doesn't include ~/.local/bin;
+/// fall back to a plain PATH search otherwise.
+fn launchConfigGUI() void {
+    var buf: [4096]u8 = undefined;
+    const n = c.readlink("/proc/self/exe", &buf, buf.len);
+    if (n > 0 and n < @as(isize, @intCast(buf.len))) {
+        const self_path = buf[0..@intCast(n)];
+        if (std.mem.lastIndexOfScalar(u8, self_path, '/')) |i| {
+            const sibling = std.fmt.allocPrint(state.ui_alloc, "{s}/dockh-config", .{self_path[0..i]}) catch null;
+            if (sibling) |cmd| {
+                if (desktop.spawnCommand(state.ui_alloc, cmd)) return;
+            }
+        }
+    }
+    _ = desktop.spawnCommand(state.ui_alloc, "dockh-config");
+}
+
+fn onCtxConfig(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    // Close the menu so the editor window gets focus cleanly.
+    dismissCurrentPopover();
+    launchConfigGUI();
 }
 
 fn pinUnpin(class: []const u8) void {
@@ -745,24 +944,40 @@ fn hideIfAutohide() void {
     }
 }
 
+/// Defer the autohide until the ghost-launch fade finishes, so the animation
+/// is visible (with autohide on, the dock would otherwise vanish the instant
+/// the app launches and swallow the ghost entirely). One-shot GLib timer;
+/// the ghost duration comes from config (clamped, so the callback is always
+/// well-formed).
+fn hideAfterGhostCallback(_: ?*anyopaque) callconv(.c) c_int {
+    hideIfAutohide();
+    return 0; // G_SOURCE_REMOVE — one shot
+}
+
+fn hideAfterGhostLaunch() void {
+    const ms: c_uint = @intCast(@max(state.cfg.magnify_ghost_ms, 150));
+    _ = c.g_timeout_add(ms, @ptrCast(&hideAfterGhostCallback), null);
+}
+
 fn contextPopover(anchor: ?*anyopaque, class: []const u8, instances: []const hypr.Client) ?*anyopaque {
     const pop = c.gtk_popover_new();
+    trackPopover(pop);
     const vbox = c.gtk_box_new(c.ORIENTATION_VERTICAL, 2);
     c.gtk_widget_add_css_class(vbox, "dockh-menu");
 
-    const header = c.gtk_label_new(cString(desktop.getAppName(state.alloc, class)));
+    const header = c.gtk_label_new(cString(desktop.getAppName(state.ui_alloc, class)));
     c.gtk_widget_add_css_class(header, "dockh-menu-title");
     c.gtk_box_append(vbox, header);
 
     for (instances) |inst| {
-        const title_perm = state.alloc.dupe(u8, if (inst.title.len > 30) inst.title[0..30] else inst.title) catch continue;
-        const ws_perm = state.alloc.dupe(u8, inst.workspace.name) catch continue;
-        const label = std.fmt.allocPrint(state.alloc, "{s}  ({s})", .{ title_perm, ws_perm }) catch title_perm;
+        const title_perm = state.ui_alloc.dupe(u8, if (inst.title.len > 30) inst.title[0..30] else inst.title) catch continue;
+        const ws_perm = state.ui_alloc.dupe(u8, inst.workspace.name) catch continue;
+        const label = std.fmt.allocPrint(state.ui_alloc, "{s}  ({s})", .{ title_perm, ws_perm }) catch title_perm;
 
-        const d: *CtxData = state.alloc.create(CtxData) catch continue;
+        const d: *CtxData = state.ui_alloc.create(CtxData) catch continue;
         d.* = .{
-            .class = state.alloc.dupe(u8, class) catch continue,
-            .address = state.alloc.dupe(u8, inst.address) catch continue,
+            .class = state.ui_alloc.dupe(u8, class) catch continue,
+            .address = state.ui_alloc.dupe(u8, inst.address) catch continue,
         };
 
         const row = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 4);
@@ -788,7 +1003,7 @@ fn contextPopover(anchor: ?*anyopaque, class: []const u8, instances: []const hyp
         c.gtk_box_append(row, fs_b);
 
         const move_b = c.gtk_button_new_with_label("move →");
-        const ma: *MoveAnchor = state.alloc.create(MoveAnchor) catch continue;
+        const ma: *MoveAnchor = state.ui_alloc.create(MoveAnchor) catch continue;
         ma.* = .{ .address = d.address, .button = move_b };
         _ = c.g_signal_connect(move_b, "clicked", @ptrCast(&onMovePopover), ma);
         c.gtk_box_append(row, move_b);
@@ -799,8 +1014,8 @@ fn contextPopover(anchor: ?*anyopaque, class: []const u8, instances: []const hyp
     const sep = c.gtk_separator_new(c.ORIENTATION_HORIZONTAL);
     c.gtk_box_append(vbox, sep);
 
-    const d: *CtxData = state.alloc.create(CtxData) catch return pop;
-    d.* = .{ .class = state.alloc.dupe(u8, class) catch "", .address = "" };
+    const d: *CtxData = state.ui_alloc.create(CtxData) catch return pop;
+    d.* = .{ .class = state.ui_alloc.dupe(u8, class) catch "", .address = "" };
 
     const pin_label = if (isPinned(class)) "Unpin" else "Pin";
     const pin_b = menuRowButton(pin_label, onCtxPin, d);
@@ -808,6 +1023,15 @@ fn contextPopover(anchor: ?*anyopaque, class: []const u8, instances: []const hyp
 
     const new_b = menuRowButton("New window", onCtxLaunch, d);
     c.gtk_box_append(vbox, new_b);
+
+    const sep2 = c.gtk_separator_new(c.ORIENTATION_HORIZONTAL);
+    c.gtk_box_append(vbox, sep2);
+
+    const cfg_b = menuRowButton("Configuration…", onCtxConfig, null);
+    c.gtk_box_append(vbox, cfg_b);
+
+    // Live system stats at the bottom of every right-click menu.
+    appendSystemMenuSection(pop, vbox);
 
     c.gtk_popover_set_child(pop, vbox);
     popupAt(pop, anchor);
@@ -825,12 +1049,22 @@ fn onUnpin(_: ?*anyopaque, ud: ?*anyopaque) callconv(.c) void {
 
 fn pinnedPopover(anchor: ?*anyopaque, class: []const u8) ?*anyopaque {
     const pop = c.gtk_popover_new();
+    trackPopover(pop);
     const vbox = c.gtk_box_new(c.ORIENTATION_VERTICAL, 2);
     c.gtk_widget_add_css_class(vbox, "dockh-menu");
-    const d: *CtxData = state.alloc.create(CtxData) catch return pop;
-    d.* = .{ .class = state.alloc.dupe(u8, class) catch "", .address = "" };
+    const d: *CtxData = state.ui_alloc.create(CtxData) catch return pop;
+    d.* = .{ .class = state.ui_alloc.dupe(u8, class) catch "", .address = "" };
     const btn = menuRowButton("Unpin", onUnpin, d);
     c.gtk_box_append(vbox, btn);
+
+    // Only two rows here — no separator needed (the context menu's item is
+    // visually grouped with a divider; this small menu stays tight).
+    const cfg_b = menuRowButton("Configuration…", onCtxConfig, null);
+    c.gtk_box_append(vbox, cfg_b);
+
+    // Live system stats on the pinned-app menu too.
+    appendSystemMenuSection(pop, vbox);
+
     c.gtk_popover_set_child(pop, vbox);
     popupAt(pop, anchor);
     return pop;
@@ -840,23 +1074,122 @@ fn pinnedPopover(anchor: ?*anyopaque, class: []const u8) ?*anyopaque {
 // Buttons
 // ---------------------------------------------------------------------------
 
+/// macOS click spring — press phase: squash the clicked icon down briefly.
+/// Called from the button's "pressed" handler; the release handler fires
+/// the bounce-back. Matched by widget pointer so only the clicked icon
+/// moves (far icons stay put), and it works even when the icon isn't
+/// magnified (rest scale 1.0 still dips).
+fn triggerPressSpring(w: ?*anyopaque) void {
+    if (!state.cfg.magnify_enabled or !state.cfg.magnify_click_spring) return;
+    if (state.cfg.magnify_press_strength <= 0) return;
+    // The pointer is (almost) idle while clicking, so the settle spring may
+    // be mid-decay — compounding it with the click spring makes the bounce
+    // mushy. Kill the settle phase here and mark it fired so it stays off
+    // until the pointer moves again.
+    spring_active = false;
+    spring_t = 0;
+    spring_fired = true;
+    press_widget = w;
+    press_active = true;
+    press_t = 0;
+    mag_inside = true; // keep the tick alive while the dip runs
+    armMagTick();
+    if (state.main_box) |box| c.gtk_widget_queue_draw(box);
+}
+
+/// macOS click spring — release phase: spring the clicked icon back with a
+/// pronounced overshoot (the "launch bounce" of the real dock). Same settle
+/// suppression as the press, so the bounce is the click's own, not a mix.
+fn triggerReleaseSpring(w: ?*anyopaque) void {
+    if (!state.cfg.magnify_enabled or !state.cfg.magnify_click_spring) return;
+    if (state.cfg.magnify_release_strength <= 0) return;
+    spring_active = false;
+    spring_t = 0;
+    spring_fired = true;
+    release_widget = w;
+    release_active = true;
+    release_t = 0;
+    mag_inside = true;
+    armMagTick();
+    if (state.main_box) |box| c.gtk_widget_queue_draw(box);
+}
+
+/// macOS ghost launch — clicking a pinned app that ISN'T running (a "ghost
+/// pin") makes the icon bounce up and fade out toward the app that's
+/// opening, exactly like the real dock. The clicked icon scales to
+/// `magnify_ghost_scale` and fades to transparent over `magnify_ghost_ms`,
+/// driven by the same frame-clock tick as the springs; when the app's
+/// openwindow event lands, the dock rebuilds and the ghost is replaced by
+/// the live running icon. Runs even when the click spring is off (it's its
+/// own animation, not a spring phase).
+fn triggerGhostLaunch(w: ?*anyopaque) void {
+    if (!state.cfg.magnify_enabled or !state.cfg.magnify_ghost_launch) return;
+    if (state.cfg.magnify_ghost_ms <= 0) return;
+    // Interrupting a previous ghost (clicking pin A then pin B within the
+    // fade window) must not leave A stuck at partial opacity — restore it
+    // before switching to the new widget.
+    if (ghost_active) {
+        if (ghost_widget) |old| {
+            if (old != w) c.gtk_widget_set_opacity(old, 1.0);
+        }
+    }
+    // A ghost pin click also fires the normal press spring — the two compose
+    // nicely (press squashes, then the ghost pulse takes over on release),
+    // so don't touch press/release state here.
+    ghost_widget = w;
+    ghost_active = true;
+    ghost_t = 0;
+    ghost_dur = @as(f64, @floatFromInt(state.cfg.magnify_ghost_ms)) / 1000.0;
+    mag_inside = true; // keep the tick alive while the ghost flies
+    armMagTick();
+    if (state.main_box) |box| c.gtk_widget_queue_draw(box);
+    if (log.debug_enabled) log.debug("ghost launch on", .{});
+}
+
 fn onTaskPress(gesture_arg: ?*anyopaque, _: c_int, _: f64, _: f64, ud: ?*anyopaque) callconv(.c) void {
     const d: *BtnData = @ptrCast(@alignCast(ud.?));
     const button = c.gtk_gesture_single_get_current_button(gesture_arg.?);
+    if (button == 1) triggerPressSpring(d.anchor);
 
     const anchor = d.anchor;
     if (button == 1) {
-        if (d.pinned or d.launcher) {
-            _ = desktop.launch(state.alloc, d.class);
+        if (d.launcher) {
+            _ = desktop.launch(state.ui_alloc, d.class);
             hideIfAutohide();
+        } else if (d.pinned) {
+            // Pinned app: if an instance is already running, FOCUS it (and
+            // switch to its workspace) instead of launching a duplicate —
+            // launching a second instance is what made clicks on open apps
+            // feel ~2s slow. Only launch when nothing is running (ghost pin).
+            if (d.address.len > 0) {
+                if (d.multiple) {
+                    const instances = taskInstances(d.class);
+                    _ = instancePopover(anchor, d.class, instances);
+                } else {
+                    hypr.focusWindow(&state.ctx, state.ui_alloc, d.address);
+                }
+            } else {
+                // Ghost pin: launch the app and fly the icon into it — the
+                // openwindow event rebuilds the dock with the running icon.
+                _ = desktop.launch(state.ui_alloc, d.class);
+                triggerGhostLaunch(d.anchor);
+                // Defer autohide until the ghost fade finishes, so the
+                // animation is actually visible (autohide=false users never
+                // hit this path).
+                if (state.cfg.autohide) {
+                    hideAfterGhostLaunch();
+                } else {
+                    hideIfAutohide();
+                }
+            }
         } else if (!d.multiple) {
-            hypr.focusWindow(&state.ctx, state.alloc, d.address);
+            hypr.focusWindow(&state.ctx, state.ui_alloc, d.address);
         } else {
             const instances = taskInstances(d.class);
             _ = instancePopover(anchor, d.class, instances);
         }
     } else if (button == 2) {
-        _ = desktop.launch(state.alloc, d.class);
+        _ = desktop.launch(state.ui_alloc, d.class);
         hideIfAutohide();
     } else if (button == 3) {
         if (d.pinned) {
@@ -868,12 +1201,30 @@ fn onTaskPress(gesture_arg: ?*anyopaque, _: c_int, _: f64, _: f64, ud: ?*anyopaq
     }
 }
 
+/// "released" — the bounce-back phase of the click spring. Only the LEFT
+/// button bounces (same gate as the press): a right-click opening the context
+/// menu or a middle-click launching an instance must not animate the icon.
+fn onTaskReleased(gesture_arg: ?*anyopaque, _: c_int, _: f64, _: f64, ud: ?*anyopaque) callconv(.c) void {
+    const d: *BtnData = @ptrCast(@alignCast(ud.?));
+    if (c.gtk_gesture_single_get_current_button(gesture_arg.?) == 1) {
+        triggerReleaseSpring(d.anchor);
+    }
+}
+
 fn onLauncherPress(gesture_arg: ?*anyopaque, _: c_int, _: f64, _: f64, ud: ?*anyopaque) callconv(.c) void {
     const d: *BtnData = @ptrCast(@alignCast(ud.?));
     const button = c.gtk_gesture_single_get_current_button(gesture_arg.?);
+    if (button == 1) triggerPressSpring(d.anchor);
     if (button == 1 or button == 2) {
-        _ = desktop.spawnCommand(state.alloc, d.class);
+        _ = desktop.spawnCommand(state.ui_alloc, d.class);
         hideIfAutohide();
+    }
+}
+
+fn onLauncherReleased(gesture_arg: ?*anyopaque, _: c_int, _: f64, _: f64, ud: ?*anyopaque) callconv(.c) void {
+    const d: *BtnData = @ptrCast(@alignCast(ud.?));
+    if (c.gtk_gesture_single_get_current_button(gesture_arg.?) == 1) {
+        triggerReleaseSpring(d.anchor);
     }
 }
 
@@ -920,16 +1271,22 @@ fn makeButtonItem(alloc: std.mem.Allocator, id: []const u8, class: []const u8, a
     const status_overlay = c.gtk_overlay_new();
     c.gtk_overlay_set_child(status_overlay, btn_child);
 
-    const pbar = c.gtk_progress_bar_new();
-    c.gtk_widget_add_css_class(pbar, "dockh-progress");
-    // per-app progress class: .dockh-progress-<app> (e.g. .dockh-progress-firefox)
-    c.gtk_widget_add_css_class(pbar, progressCssClass(alloc, class));
-    c.gtk_progress_bar_set_show_text(pbar, 0);
-    c.gtk_progress_bar_set_fraction(pbar, 0);
-    c.gtk_widget_set_halign(pbar, c.ALIGN_FILL);
-    c.gtk_widget_set_valign(pbar, c.ALIGN_END);
-    c.gtk_overlay_add_overlay(status_overlay, pbar);
-    c.gtk_widget_hide(pbar);
+    // macOS-style media progress bar under the icon — OFF by default
+    // ([progress] enabled = false): don't even build the widget, so nothing
+    // can ever show. When enabled it starts hidden and the playerctl poll
+    // (status.zig) drives it only with real progress.
+    const pbar = if (state.cfg.progress_enabled) blk: {
+        const pb = c.gtk_progress_bar_new();
+        c.gtk_widget_add_css_class(pb, "dockh-progress");
+        c.gtk_widget_add_css_class(pb, progressCssClass(alloc, class));
+        c.gtk_progress_bar_set_show_text(pb, 0);
+        c.gtk_progress_bar_set_fraction(pb, 0);
+        c.gtk_widget_set_halign(pb, c.ALIGN_FILL);
+        c.gtk_widget_set_valign(pb, c.ALIGN_END);
+        c.gtk_overlay_add_overlay(status_overlay, pb);
+        c.gtk_widget_hide(pb);
+        break :blk pb;
+    } else null;
 
     const badge = c.gtk_label_new("0");
     c.gtk_widget_add_css_class(badge, "dockh-badge");
@@ -940,15 +1297,15 @@ fn makeButtonItem(alloc: std.mem.Allocator, id: []const u8, class: []const u8, a
     c.gtk_overlay_add_overlay(status_overlay, badge);
     c.gtk_widget_hide(badge);
 
-    item_status.append(state.alloc, .{
-        .class = state.alloc.dupe(u8, class) catch "",
+    item_status.append(state.ui_alloc, .{
+        .class = state.ui_alloc.dupe(u8, class) catch "",
         .progress = pbar,
         .badge = badge,
     }) catch {};
 
     c.gtk_button_set_child(btn, status_overlay);
     const tooltip = if (pinned and instances == 0)
-        std.fmt.allocPrint(state.alloc, "Launch {s}", .{desktop.getAppName(alloc, class)}) catch desktop.getAppName(alloc, class)
+        std.fmt.allocPrint(state.ui_alloc, "Launch {s}", .{desktop.getAppName(alloc, class)}) catch desktop.getAppName(alloc, class)
     else
         desktop.getAppName(alloc, class);
     c.gtk_widget_set_tooltip_text(btn, cString(tooltip));
@@ -967,8 +1324,10 @@ fn makeButtonItem(alloc: std.mem.Allocator, id: []const u8, class: []const u8, a
     };
     if (launcher) {
         _ = c.g_signal_connect(gesture, "pressed", @ptrCast(&onLauncherPress), d);
+        _ = c.g_signal_connect(gesture, "released", @ptrCast(&onLauncherReleased), d);
     } else {
         _ = c.g_signal_connect(gesture, "pressed", @ptrCast(&onTaskPress), d);
+        _ = c.g_signal_connect(gesture, "released", @ptrCast(&onTaskReleased), d);
     }
     c.gtk_widget_add_controller(btn, gesture);
 
@@ -1009,10 +1368,31 @@ fn makeButtonItem(alloc: std.mem.Allocator, id: []const u8, class: []const u8, a
 // Main box assembly
 // ---------------------------------------------------------------------------
 
+/// Does a running client class match a pin/task id? Mirrors
+/// status.appMatchesClass: case-insensitive exact, prefix form (pin "brave" ↔
+/// class "brave-browser"), and dotted-suffix on EITHER side (pin
+/// "org.mozilla.firefox" ↔ class "firefox"; class "com.obsidian.Obsidian" ↔
+/// pin "obsidian"). Min 3 chars so short ids can't over-match. Without this,
+/// a dotted desktop-id pin would never match its running windows and the
+/// click fix below would still launch a duplicate.
+fn taskClassMatches(a: []const u8, b: []const u8) bool {
+    if (a.len < 3 or b.len < 3) return false;
+    if (std.ascii.eqlIgnoreCase(a, b)) return true;
+    if (std.ascii.startsWithIgnoreCase(b, a)) return true;
+    if (std.ascii.startsWithIgnoreCase(a, b)) return true;
+    if (std.mem.lastIndexOfScalar(u8, a, '.')) |i| {
+        if (std.ascii.eqlIgnoreCase(a[i + 1 ..], b)) return true;
+    }
+    if (std.mem.lastIndexOfScalar(u8, b, '.')) |i| {
+        if (std.ascii.eqlIgnoreCase(b[i + 1 ..], a)) return true;
+    }
+    return false;
+}
+
 fn taskInstances(class: []const u8) []const hypr.Client {
     var result: std.ArrayList(hypr.Client) = .empty;
     for (state.clients) |cl| {
-        if (std.ascii.eqlIgnoreCase(cl.class, class)) {
+        if (taskClassMatches(cl.class, class)) {
             result.append(state.scratch, cl) catch {};
         }
     }
@@ -1053,7 +1433,7 @@ pub fn savePinned() void {
         buf.append(state.alloc, '\n') catch {};
     }
     const path = main_mod.pinnedFilePath();
-    @import("../core/fs.zig").writeFile(path, buf.items) catch {};
+    @import("fs").writeFile(path, buf.items) catch {};
 }
 
 fn clientLessThan(a: hypr.Client, b: hypr.Client) bool {
@@ -1064,9 +1444,15 @@ fn clientLessThan(a: hypr.Client, b: hypr.Client) bool {
 fn clearBox(box: ?*anyopaque) void {
     // The dock is being rebuilt — any open menu would dangle its anchor.
     dismissCurrentPopover();
-    item_status.clearRetainingCapacity();
     resetMagnifyState(); // cancel the tick; stale transforms must go
-    mag_items.clearRetainingCapacity();
+    sys_label = null; // the label widget is being destroyed with the tree
+    // Drop the per-rebuild registries. Their backing buffers live in
+    // ui_arena, which rebuildMainBox resets right after clearBox destroys
+    // the old widgets — reassigning .empty (instead of clearRetainingCapacity)
+    // discards the stale buffer pointer so the next append reallocates from
+    // the fresh arena.
+    item_status = .empty;
+    mag_items = .empty;
     var child = c.gtk_widget_get_first_child(box);
     while (child != null) {
         const next = c.gtk_widget_get_next_sibling(child);
@@ -1081,12 +1467,96 @@ fn launcherButton(alloc: std.mem.Allocator) ?*anyopaque {
     return makeButtonItem(alloc, icon, state.cfg.launcher_cmd, "", false, false, true, false, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Optional system monitor (RAM / CPU / temperature)
+// ---------------------------------------------------------------------------
+// A single label at the end of the dock, updated every system.interval_ms by
+// status.zig's pollSystem (same status-poll timers as progress/badges — no
+// extra subprocesses, /proc + sysfs reads only). The text is set in place
+// (gtk_label_set_text copies), so the timer never rebuilds the dock.
+
+/// True when the system monitor is enabled at all — the right-click menu
+/// section (and the optional dock pill) only exist when there is something
+/// to show.
+pub fn systemEnabled() bool {
+    return state.cfg.system_enabled and
+        (state.cfg.system_ram or state.cfg.system_cpu or state.cfg.system_temp);
+}
+
+/// Build the dock pill (or null). OFF by default: `[system] dock = true`
+/// opts into the always-visible pill at the end of the dock — constant
+/// stats in a dock are noise, the context menu is the good UX. Registers it
+/// as the global sys_label so pollSystem can update it without a rebuild.
+fn makeSystemItem() ?*anyopaque {
+    if (!systemEnabled() or !state.cfg.system_dock) return null;
+    const lbl = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(lbl, "dockh-sys");
+    c.gtk_widget_set_halign(lbl, c.ALIGN_CENTER);
+    c.gtk_widget_set_valign(lbl, c.ALIGN_CENTER);
+    sys_label = lbl;
+    return lbl;
+}
+
+/// Append the live "System" section to a right-click context menu — the
+/// home of the monitor (see the sys_label header comment): a separator, a
+/// small title and the RAM/CPU/temp label. The label is registered as
+/// sys_menu_label, so the same pollSystem timer updates it in place while
+/// the popover is open; dismissCurrentPopover clears the pointer when the
+/// menu closes.
+fn appendSystemMenuSection(pop: ?*anyopaque, vbox: ?*anyopaque) void {
+    if (!systemEnabled()) return;
+    const sep = c.gtk_separator_new(c.ORIENTATION_HORIZONTAL);
+    c.gtk_box_append(vbox, sep);
+    const title = c.gtk_label_new("System");
+    c.gtk_widget_add_css_class(title, "dockh-menu-title");
+    c.gtk_box_append(vbox, title);
+    const lbl = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(lbl, "dockh-sys");
+    c.gtk_widget_set_halign(lbl, c.ALIGN_START);
+    c.gtk_box_append(vbox, lbl);
+    sys_menu_label = lbl;
+    sys_menu_pop = pop;
+}
+
+/// Update the system labels in place (called from the poll timer): the dock
+/// pill (if any) and the open context menu's System section (if any).
+/// gtk_label_set_text copies, so the caller's buffer can be a stack array.
+pub fn setSystemText(text: [:0]const u8) void {
+    if (sys_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
+    if (sys_menu_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
+}
+
+/// Show/hide the system labels — hidden when every segment failed to produce
+/// data (no RAM/CPU/temp readable), so no empty pill with padding sits in
+/// the dock.
+pub fn setSystemVisible(visible: bool) void {
+    if (sys_label) |lbl| {
+        if (visible) {
+            c.gtk_widget_show(lbl);
+        } else {
+            c.gtk_widget_hide(lbl);
+        }
+    }
+    if (sys_menu_label) |lbl| {
+        if (visible) {
+            c.gtk_widget_show(lbl);
+        } else {
+            c.gtk_widget_hide(lbl);
+        }
+    }
+}
+
 /// Rebuild the whole dock content. Called on every Hyprland event that
-/// matters; cheap enough (a handful of widget creations).
+/// matters. Every allocation the new widgets make (CSS class names, tooltips,
+/// BtnData, popover data, .desktop lookups) goes into the per-rebuild
+/// `ui_arena`, which is wiped on the next rebuild — so the permanent arena
+/// never grows with events and RSS stays flat instead of creeping toward
+/// 200 MB.
 pub fn rebuildMainBox() void {
-    const alloc = state.alloc;
     const mb = state.main_box orelse return;
-    clearBox(mb);
+    clearBox(mb); // destroy the old widget tree first (frees ui_arena refs)
+    state.resetUi(); // wipe the previous generation's allocations
+    const alloc = state.ui_alloc;
 
     if (std.mem.eql(u8, state.cfg.launcher_pos, "start")) {
         if (launcherButton(alloc)) |lb| c.gtk_box_append(mb, lb);
@@ -1158,5 +1628,11 @@ pub fn rebuildMainBox() void {
         if (launcherButton(alloc)) |lb| c.gtk_box_append(mb, lb);
     }
 
+    // Optional system monitor at the very end of the dock (RAM/CPU/temp).
+    if (makeSystemItem()) |si| c.gtk_box_append(mb, si);
+
     c.gtk_widget_show(mb);
+    // The box size may have changed (pinned apps added/removed) — keep the
+    // GL glass area the same size so the window hugs the box (texture 1:1).
+    glass.syncSize();
 }

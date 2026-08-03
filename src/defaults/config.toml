@@ -11,7 +11,7 @@ exclusive = false        # reserve space (forces layer = top)
 autohide = false         # show on hotspot hover, hide on leave
 hide_on_activity = false # intellihide: hide when the active workspace has windows, show when empty
 resident = false         # always visible; toggled via SIGRTMIN+1
-icon_size = 32          # macOS-like: ~32px icons with magnify on hover
+icon_size = 40          # macOS-like: ~32px icons with magnify on hover
 num_workspaces = 10
 target_output = ""       # e.g. "DP-1" — empty = focused monitor
 
@@ -53,20 +53,83 @@ duration_ms = 40         # exponential ease constant in ms: higher = smoother fo
 # before resting — all in code, no CSS transition.
 spring = true            # enable the settle bounce
 spring_strength = 0.06   # bounce amplitude, fraction of each icon's scale (0-0.25)
+# macOS click spring: pressing an icon squashes it down, releasing springs it
+# back with a pronounced overshoot (the dock's "launch bounce").
+click_spring = true      # enable press/release bounce on click
+press_strength = 0.12    # squash depth on press, fraction of scale (0-0.30)
+release_strength = 0.22  # overshoot on release, fraction of scale (0-0.50)
+# macOS ghost launch: clicking a pinned app that ISN'T running makes the
+# icon bounce up and fade out toward the app that opens (like the real
+# dock) — the openwindow event then replaces it with the running icon.
+ghost_launch = true      # enable the launch bounce+fade
+ghost_ms = 600           # fade duration in ms
+ghost_scale = 1.35       # peak scale while fading (1.0 = no growth)
 
 [progress]
 # macOS-style media progress bar under the icon of the playing app
-# (requires playerctl). 0 hides it; false disables polling.
-enabled = true
+# (requires playerctl). Off by default — set true to enable it.
+enabled = false
 
 [badge]
 # Notification counter on each app icon (requires mako + makoctl).
 enabled = true
 threshold = 5   # switch to the .dockh-badge.high style (red) at >= N notifications; 0 = never
 
+[system]
+# System monitor (RAM / CPU / temperature), read straight from /proc and
+# /sys — no external tools, no subprocesses. Lives in the RIGHT-CLICK
+# context menu of every dock item (live, updated every interval_ms); set
+# `dock = true` to additionally show it as a compact pill at the end of
+# the dock.
+enabled = false          # off by default
+interval_ms = 2000        # refresh rate (min 500 ms)
+dock = false              # show the pill in the dock itself (opt-in)
+ram = true                # show used RAM (e.g. "RAM 4.2G")
+cpu = true                # show CPU usage % (e.g. "CPU 23%")
+temp = true               # show CPU temperature (e.g. "52°C")
+
 [glow]
-enabled = true           # in-dock blur halo behind the active app's icon
+# In-dock blur halo behind the active app's icon. OFF by default: the blurred
+# copy renders as a grainy "shadow" around the icon while magnified. Turn it
+# on only if you want the halo effect.
+enabled = false
 radius = 8               # Gaussian radius in px (0 disables)
+
+[appearance]
+# Icon drop shadow, injected into the CSS dynamically (hot-reloads with
+# config.toml — no style.css editing). Off by default.
+icon_shadow = false      # true = soft shadow behind each dock icon
+icon_shadow_radius = 8   # blur radius in px; 0 = sharp edge
+
+[glass]
+# Real GLSL "liquid glass" panel, rendered by a GtkGLArea behind the icons:
+# SDF rounded rect, refraction of the desktop captured with grim, chromatic
+# dispersion, specular bevel, frost blur and a volumetric depth tint. The
+# desktop region behind the dock is re-captured on workspace changes.
+# Falls back to the pure-CSS glass automatically if GL or grim are missing.
+# OFF by default (CSS glass); enable it for the full liquid-glass shader
+# (needs grim + a GL 3.3 context, adds ~70 MB of Mesa RSS — see [memory]).
+enabled = false
+radius = 22              # corner radius (px)
+margin = 8               # inset (px) — must match the #dockh-box CSS margin
+refraction = 0.55        # 0..1 bend strength at the panel edges
+splay = 0.6              # 0..1 width of the edge curvature (lens falloff)
+dispersion = 0.25        # 0..1 chromatic separation (prism effect)
+frost = 0.35             # 0..1 frosted blur radius
+depth = 0.2              # 0..1 volumetric tint toward the center
+light_angle = -45        # degrees: direction of the specular bevel highlight
+alpha = 0.85             # 0..1 overall panel opacity
+
+[memory]
+# RSS watchdog — guarantees dockh never eats the machine, no matter what
+# GTK or Mesa do. The dock samples its own RSS every watch_sec seconds:
+#   trim_above_mb:   force malloc_trim when RSS exceeds this (MiB)
+#   glass_off_mb:    drop the liquid-glass shader when RSS exceeds this (MiB)
+#                    → HARD CEILING: falls back to the pure-CSS glass
+#                    (~80 MB, frees the GL context). 0 = never.
+watch_sec = 5
+trim_above_mb = 165
+glass_off_mb = 210
 
 [apps]
 css_file = "style.css"

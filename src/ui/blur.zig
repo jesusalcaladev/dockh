@@ -14,7 +14,7 @@
 //! (the previous gsk_renderer_render_texture approach measured +61 MB RSS).
 //! If neither path is usable the dock simply skips the glow (no crash).
 const std = @import("std");
-const c = @import("../c.zig");
+const c = @import("c"); // named module (build.zig)
 const state = @import("../core/state.zig");
 const log = @import("../core/log.zig");
 

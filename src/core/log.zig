@@ -1,7 +1,7 @@
 //! Minimal leveled logging to stderr, with epoch timestamps. No stdlib time
 //! API needed — std.time lost its timestamp helpers in Zig 0.16.
 const std = @import("std");
-const c = @import("../c.zig");
+const c = @import("c"); // named module (build.zig)
 
 pub var debug_enabled: bool = false;
 

@@ -11,12 +11,13 @@ build:
 
 install: build
 	install -Dm755 zig-out/bin/dockh $(DESTDIR)$(BINDIR)/dockh
+	install -Dm755 zig-out/bin/dockh-config $(DESTDIR)$(BINDIR)/dockh-config
 	# Keep config/ in sync with src/defaults/ (the embedded first-run copies).
 	install -Dm644 config/style.css $(DESTDIR)$(DATADIR)/style.css
 	install -Dm644 config/config.toml $(DESTDIR)$(DATADIR)/config.toml
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/dockh
+	rm -f $(DESTDIR)$(BINDIR)/dockh $(DESTDIR)$(BINDIR)/dockh-config
 	rm -rf $(DESTDIR)$(DATADIR)
 
 run: build

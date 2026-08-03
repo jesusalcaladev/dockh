@@ -11,6 +11,7 @@
 #
 # Installs:
 #   <prefix>/bin/dockh
+#   <prefix>/bin/dockh-config      (graphical config editor)
 #   <prefix>/share/dockh/style.css
 #   <prefix>/share/dockh/config.toml
 
@@ -37,6 +38,7 @@ Usage:
 
 Installs:
   <prefix>/bin/dockh
+  <prefix>/bin/dockh-config   (graphical config editor)
   <prefix>/share/dockh/style.css
   <prefix>/share/dockh/config.toml
 EOF
@@ -93,8 +95,8 @@ check_deps() {
 # ---------------------------------------------------------------------------
 
 uninstall() {
-    echo "dockh: removing $BINDIR/dockh and $DATADIR"
-    rm -f "$BINDIR/dockh"
+    echo "dockh: removing $BINDIR/dockh, $BINDIR/dockh-config and $DATADIR"
+    rm -f "$BINDIR/dockh" "$BINDIR/dockh-config"
     rm -rf "$DATADIR"
     echo "dockh: uninstalled."
     exit 0
@@ -136,13 +138,15 @@ if [ "$USER_MODE" != "1" ] && [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "dockh: installing to $PREFIX"
-install -Dm755 zig-out/bin/dockh "$BINDIR/dockh"
-install -Dm644 config/style.css   "$DATADIR/style.css"
-install -Dm644 config/config.toml "$DATADIR/config.toml"
+install -Dm755 zig-out/bin/dockh        "$BINDIR/dockh"
+install -Dm755 zig-out/bin/dockh-config "$BINDIR/dockh-config"
+install -Dm644 config/style.css         "$DATADIR/style.css"
+install -Dm644 config/config.toml       "$DATADIR/config.toml"
 
 echo
 echo "dockh: installed. Start it with:"
 echo "  $BINDIR/dockh"
+echo "  $BINDIR/dockh-config    (graphical config editor)"
 echo
 echo "First run creates ~/.config/dockh/{config.toml,style.css} for customization."
 echo "For the liquid-glass blur, add to hyprland.conf:"

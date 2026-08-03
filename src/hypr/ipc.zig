@@ -3,7 +3,7 @@
 //!  - `.socket2.sock` : event socket, consumed event-driven through the
 //!                      GLib main loop via g_unix_fd_add — no polling.
 const std = @import("std");
-const c = @import("../c.zig");
+const c = @import("c"); // named module (build.zig)
 
 pub const Workspace = struct {
     id: i32 = 0,

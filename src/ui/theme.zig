@@ -8,9 +8,9 @@
 //! the providers are swapped out (remove old + add new) after a short debounce
 //! so partial writes / atomic renames never flash a broken theme.
 const std = @import("std");
-const c = @import("../c.zig");
+const c = @import("c"); // named module (build.zig)
 const config = @import("../core/config.zig");
-const fs = @import("../core/fs.zig");
+const fs = @import("fs"); // named module (build.zig)
 const log = @import("../core/log.zig");
 
 var file_provider: ?*anyopaque = null;
@@ -180,6 +180,26 @@ pub fn loadAnimation(cfg: *const config.Config) void {
     // Press feedback — after the mag ladder so it wins on equal specificity.
     const active = "#dockh-window .dockh-item:active .dockh-btn { transform: scale(0.92); }\n";
     css.appendSlice(alloc, active) catch return;
+
+    // Icon drop shadow, driven by [appearance] in config.toml (injected here
+    // so it hot-reloads live with the rest of the config — no style.css
+    // editing). Specificity beats the user stylesheet's `.dockh-btn image`.
+    // NOTE: GTK's CSS parser rejects decimal lengths ("8.0px" → parse
+    // error), so the radius is emitted as a whole pixel number.
+    if (cfg.icon_shadow) {
+        const r: i64 = @intFromFloat(@max(@min(cfg.icon_shadow_radius, 64), 0));
+        const sh = std.fmt.allocPrint(alloc,
+            "#dockh-window .dockh-btn image {{ -gtk-icon-shadow: 0 2px {d}px rgba(0, 0, 0, 0.45); }}\n",
+            .{r}) catch return;
+        defer alloc.free(sh);
+        css.appendSlice(alloc, sh) catch return;
+    } else {
+        // Plain literal (NOT a format string): braces stay single. Using
+        // {{ }} here would emit literal double braces and break GTK's parser
+        // ("Expected an identifier") — this exact bug was caught in testing.
+        const none = "#dockh-window .dockh-btn image { -gtk-icon-shadow: none; }\n";
+        css.appendSlice(alloc, none) catch return;
+    }
 
     const provider = c.gtk_css_provider_new();
     const css_z = alloc.dupeZ(u8, css.items) catch {
