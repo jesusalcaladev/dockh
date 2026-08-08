@@ -683,10 +683,16 @@ fn createShotSection() ?*anyopaque {
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
 
     // Screenshot thumbnail (rounded via the border-radius clip of GTK4).
+    // Clicking it copies the image straight to the clipboard (macOS-style).
     shot_image = c.gtk_image_new();
     c.gtk_widget_set_name(shot_image, "island-shot-image");
     c.gtk_widget_set_size_request(shot_image, 96, 96);
     setImageIcon(shot_image, "island-screenshot", "camera-photo-symbolic", 28);
+    c.gtk_widget_set_cursor_from_name(shot_image, "pointer");
+    const shot_gesture = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(shot_gesture, 1);
+    c.gtk_widget_add_controller(shot_image, shot_gesture);
+    _ = c.g_signal_connect(shot_gesture, "pressed", @ptrCast(&onShotThumbClicked), null);
     c.gtk_box_append(box, shot_image);
 
     // Right column: app label, title (filename), body, actions.
@@ -951,6 +957,15 @@ fn onShotCopy(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
 
 fn onShotOpen(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     shotShellCmd("xdg-open ");
+}
+
+/// Click on the screenshot thumbnail: copy the image to the clipboard and
+/// dismiss the island (macOS behavior).
+fn onShotThumbClicked(_: ?*anyopaque, _: c_int, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
+    if (mode != .screenshot) return;
+    shotShellCmd("wl-copy < ");
+    cancelNotifTimer();
+    returnToPrev();
 }
 
 fn spawnArgv(argv: []const []const u8) void {
