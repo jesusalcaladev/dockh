@@ -127,6 +127,10 @@ const island_css =
     \\#dockh-island.expanded {
     \\    border-radius: 42px;
     \\}
+    \\/* Pop-out sections fit content with 8px padding; labels cap width. */
+    \\#island-music, #island-notif, #island-osd, #island-shot {
+    \\    padding: 8px;
+    \\}
     \\
     \\@keyframes island-pop {
     \\    from { opacity: 0; }
@@ -475,17 +479,12 @@ fn createMusicSection() ?*anyopaque {
     const box = c.gtk_box_new(c.ORIENTATION_VERTICAL, 0);
     music_box = box;
     c.gtk_widget_set_name(box, "island-music");
-    c.gtk_widget_set_size_request(box, EXPANDED_W, EXPANDED_H);
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
-    c.gtk_widget_set_hexpand(box, 1);
 
     // metadata row: art | title/artist | equalizer
     const row_top = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 12);
     c.gtk_widget_set_halign(row_top, c.ALIGN_CENTER);
     c.gtk_widget_set_valign(row_top, c.ALIGN_CENTER);
-    c.gtk_widget_set_margin_top(row_top, 26);
-    c.gtk_widget_set_margin_start(row_top, 18);
-    c.gtk_widget_set_margin_end(row_top, 18);
 
     art_wrap = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_name(art_wrap, "island-art-wrap");
@@ -504,12 +503,14 @@ fn createMusicSection() ?*anyopaque {
     c.gtk_widget_set_name(music_title_label, "island-song-title");
     c.gtk_widget_set_halign(music_title_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(music_title_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(music_title_label, 26);
     c.gtk_box_append(mid, music_title_label);
 
     music_artist_label = c.gtk_label_new("");
     c.gtk_widget_set_name(music_artist_label, "island-song-artist");
     c.gtk_widget_set_halign(music_artist_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(music_artist_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(music_artist_label, 30);
     c.gtk_box_append(mid, music_artist_label);
 
     c.gtk_box_append(row_top, mid);
@@ -543,8 +544,6 @@ fn createMusicSection() ?*anyopaque {
     // controls row: spacer | prev/play/next centered | airplay (space-between)
     const row_ctl = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_margin_top(row_ctl, 9);
-    c.gtk_widget_set_margin_start(row_ctl, 28);
-    c.gtk_widget_set_margin_end(row_ctl, 28);
 
     const spacer = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_size_request(spacer, 34, 1);
@@ -612,9 +611,6 @@ fn createNotifSection() ?*anyopaque {
     const box = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 12);
     notif_box = box;
     c.gtk_widget_set_name(box, "island-notif");
-    // Center vertically inside the fixed-size pill; stretch horizontally.
-    c.gtk_widget_set_size_request(box, EXPANDED_W, EXPANDED_H);
-    c.gtk_widget_set_hexpand(box, 1);
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
 
     notif_icon = c.gtk_image_new();
@@ -631,18 +627,21 @@ fn createNotifSection() ?*anyopaque {
     c.gtk_widget_set_name(notif_app_label, "island-notif-app");
     c.gtk_widget_set_halign(notif_app_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(notif_app_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(notif_app_label, 12);
     c.gtk_box_append(text_box, notif_app_label);
 
     notif_title_label = c.gtk_label_new("");
     c.gtk_widget_set_name(notif_title_label, "island-notif-title");
     c.gtk_widget_set_halign(notif_title_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(notif_title_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(notif_title_label, 30);
     c.gtk_box_append(text_box, notif_title_label);
 
     notif_body_label = c.gtk_label_new("");
     c.gtk_widget_set_name(notif_body_label, "island-notif-body");
     c.gtk_widget_set_halign(notif_body_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(notif_body_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(notif_body_label, 34);
     c.gtk_box_append(text_box, notif_body_label);
 
     c.gtk_box_append(box, text_box);
@@ -660,8 +659,6 @@ fn createOsdSection() ?*anyopaque {
     const box = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 14);
     osd_box = box;
     c.gtk_widget_set_name(box, "island-osd");
-    c.gtk_widget_set_size_request(box, EXPANDED_W, EXPANDED_H);
-    c.gtk_widget_set_hexpand(box, 1);
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
     c.gtk_widget_set_halign(box, c.ALIGN_CENTER);
 
@@ -681,6 +678,7 @@ fn createOsdSection() ?*anyopaque {
     osd_progress = c.gtk_progress_bar_new();
     c.gtk_widget_set_name(osd_progress, "island-osd-progress");
     c.gtk_widget_set_hexpand(osd_progress, 1);
+    c.gtk_widget_set_size_request(osd_progress, 200, -1); // usable slider width
     c.gtk_progress_bar_set_fraction(osd_progress, 0);
     c.gtk_progress_bar_set_show_text(osd_progress, 0);
     c.gtk_box_append(right, osd_progress);
@@ -693,8 +691,6 @@ fn createShotSection() ?*anyopaque {
     const box = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 12);
     shot_box = box;
     c.gtk_widget_set_name(box, "island-shot");
-    c.gtk_widget_set_size_request(box, EXPANDED_W, EXPANDED_H);
-    c.gtk_widget_set_hexpand(box, 1);
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
 
     // Screenshot thumbnail (rounded via the border-radius clip of GTK4).
@@ -718,12 +714,14 @@ fn createShotSection() ?*anyopaque {
     c.gtk_widget_set_name(shot_title_label, "island-shot-title");
     c.gtk_widget_set_halign(shot_title_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(shot_title_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(shot_title_label, 26);
     c.gtk_box_append(right, shot_title_label);
 
     shot_body_label = c.gtk_label_new("");
     c.gtk_widget_set_name(shot_body_label, "island-shot-body");
     c.gtk_widget_set_halign(shot_body_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(shot_body_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_max_width_chars(shot_body_label, 34);
     c.gtk_box_append(right, shot_body_label);
 
     const controls = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 6);
@@ -819,7 +817,9 @@ fn setMode(new_mode: Mode) void {
         const expanded = new_mode != .idle and new_mode != .music_min;
         if (expanded) {
             c.gtk_widget_add_css_class(w, "expanded");
-            c.gtk_window_set_default_size(w, EXPANDED_W, EXPANDED_H);
+            // No fixed size: the window fits the section's content (8px
+            // padding, capped by the CSS max-width rules).
+            c.gtk_window_set_default_size(w, -1, -1);
         } else {
             c.gtk_widget_remove_css_class(w, "expanded");
             c.gtk_window_set_default_size(w, if (new_mode == .music_min) MIN_W else IDLE_W, if (new_mode == .music_min) MIN_H else IDLE_H);

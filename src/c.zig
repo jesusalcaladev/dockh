@@ -65,6 +65,7 @@ pub extern fn gtk_widget_hide(widget: GtkWidget) void;
 pub extern fn gtk_widget_set_visible(widget: GtkWidget, visible: c_int) void;
 pub extern fn gtk_widget_is_visible(widget: GtkWidget) c_int;
 pub extern fn gtk_label_set_ellipsize(label: GtkWidget, mode: c_int) void;
+pub extern fn gtk_label_set_max_width_chars(label: GtkWidget, n_chars: c_int) void;
 pub extern fn gtk_image_set_from_icon_name(image: GtkWidget, icon_name: [*:0]const u8) void;
 
 // Pango ellipsize modes
