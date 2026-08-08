@@ -1,20 +1,16 @@
-/* dockh default theme — clean macOS-style dock on Hyprland.
+/* dockh default theme — OpenAI black/white on Hyprland.
  *
- * The dock renders through GTK4/GSK (hardware accelerated). For the blur
- * behind the panel, add these layer rules to your hyprland.conf:
- *
- *   layerrule = blur, dockh
- *   layerrule = ignorealpha 0.5, dockh
- *   layerrule = blur, dockh-hotspot
+ * The dock renders through GTK4/GSK (hardware accelerated). Solid dark pill,
+ * no gradients, hairline borders — matches the Dynamic Island aesthetic.
  *
  * Animation values (scale / duration / curve) live in config.toml under
  * [animation] and are injected at runtime as `transition: transform`.
  */
 
-@define-color accent          #5ac8fa;
-@define-color accent_soft     rgba(90, 200, 250, 0.30);
-@define-color fg              #e8eaf0;
-@define-color fg_dim         rgba(232, 234, 240, 0.50);
+@define-color accent          #ffffff;
+@define-color accent_soft     rgba(255, 255, 255, 0.25);
+@define-color fg              #ffffff;
+@define-color fg_dim         rgba(255, 255, 255, 0.55);
 @define-color indicator_idle  rgba(255, 255, 255, 0.25);
 @define-color indicator_run   rgba(255, 255, 255, 0.55);
 
@@ -28,15 +24,14 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Dock chrome: dark translucent pill — clean and minimal.            */
+/* Dock chrome: solid dark pill — clean, minimal, no gradient.        */
 /* ------------------------------------------------------------------ */
 
 #dockh-box {
-    background-color: rgba(20, 22, 30, 0.72);
+    background-color: rgba(0, 0, 0, 0.55);
     border: 1px solid rgba(255, 255, 255, 0.10);
     border-radius: 18px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45),
-                inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
     padding: 6px;
     margin: 8px;
 }
@@ -73,8 +68,8 @@
 }
 
 .dockh-btn:active {
-    background-color: rgba(90, 200, 250, 0.15);
-    box-shadow: inset 0 0 0 1px rgba(90, 200, 250, 0.30);
+    background-color: rgba(255, 255, 255, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
 }
 
 /* ------------------------------------------------------------------ */
@@ -87,7 +82,7 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Media progress bar: thin accent line under playing apps.          */
+/* Media progress bar: thin white line under playing apps.            */
 /* ------------------------------------------------------------------ */
 
 .dockh-progress {
@@ -116,8 +111,8 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-badge {
-    background-color: rgba(232, 234, 240, 0.85);
-    color: #10131c;
+    background-color: rgba(255, 255, 255, 0.90);
+    color: #0a0a0c;
     font-weight: 700;
     font-size: 9px;
     border-radius: 999px;
@@ -133,12 +128,12 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Launcher: accent-tinted pill.                                      */
+/* Launcher: white-tinted pill.                                       */
 /* ------------------------------------------------------------------ */
 
 .dockh-launcher .dockh-btn {
-    background-color: rgba(90, 200, 250, 0.08);
-    box-shadow: inset 0 0 0 1px rgba(90, 200, 250, 0.15);
+    background-color: rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
 }
 
 .dockh-launcher .dockh-indicator {
@@ -154,8 +149,8 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-item.active .dockh-btn {
-    background-color: rgba(90, 200, 250, 0.12);
-    box-shadow: inset 0 0 0 1px rgba(90, 200, 250, 0.28);
+    background-color: rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
 }
 
 .dockh-item.running .dockh-btn {
@@ -177,7 +172,7 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-separator {
-    background-color: rgba(255, 255, 255, 0.08);
+    background-color: rgba(255, 255, 255, 0.10);
     min-width: 1px;
     min-height: 1px;
     border-radius: 1px;
@@ -217,7 +212,7 @@
 /* ------------------------------------------------------------------ */
 
 .dockh-menu {
-    background-color: rgba(20, 22, 30, 0.92);
+    background-color: rgba(10, 10, 12, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.10);
     border-radius: 14px;
     padding: 6px;

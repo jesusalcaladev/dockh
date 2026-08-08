@@ -1,0 +1,158 @@
+/* waybar — OpenAI black/white theme for omarchy.
+ *
+ * Floating dark pills with hairline borders, matching the dockh Dynamic
+ * Island. Swap this into ~/.config/waybar/style.css (backup yours first),
+ * then `killall waybar && waybar &` (or `omarchy restart waybar`).
+ */
+
+* {
+    font-family: "Inter", "JetBrainsMono Nerd Font", sans-serif;
+    font-size: 13px;
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+}
+
+window#waybar {
+    background-color: transparent;
+    color: #ffffff;
+    transition-property: background-color;
+    transition-duration: 0.3s;
+}
+
+window#waybar.hidden {
+    opacity: 0.2;
+}
+
+/* Floating pill: the whole bar sits in a dark rounded capsule. */
+window#waybar > box {
+    margin: 6px 10px;
+    background-color: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 18px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+tooltip {
+    background-color: rgba(10, 10, 12, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 10px;
+    color: #ffffff;
+}
+
+/* ---------------------------------------------------------------- */
+/* Modules: transparent so the pill shows through.                   */
+/* ---------------------------------------------------------------- */
+
+#workspaces,
+#clock,
+#custom-weather,
+#custom-update,
+#custom-voxtype,
+#custom-screenrecording-indicator,
+#custom-idle-indicator,
+#custom-notification-silencing-indicator,
+#bluetooth,
+#network,
+#pulseaudio,
+#cpu,
+#battery,
+#custom-omarchy,
+#tray,
+#custom-expand-icon {
+    background-color: transparent;
+    color: rgba(255, 255, 255, 0.85);
+    padding: 0 10px;
+    margin: 4px 2px;
+    border-radius: 999px;
+    transition: background-color 140ms ease;
+}
+
+/* ---------------------------------------------------------------- */
+/* Workspaces                                                       */
+/* ---------------------------------------------------------------- */
+
+#workspaces button {
+    background-color: transparent;
+    color: rgba(255, 255, 255, 0.45);
+    padding: 0 6px;
+    margin: 2px 1px;
+    border-radius: 999px;
+    font-weight: 600;
+}
+
+#workspaces button:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+}
+
+#workspaces button.active {
+    background-color: rgba(255, 255, 255, 0.16);
+    color: #ffffff;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
+}
+
+#workspaces button.urgent {
+    background-color: #e5484d;
+    color: #ffffff;
+}
+
+/* ---------------------------------------------------------------- */
+/* Clock & status                                                    */
+/* ---------------------------------------------------------------- */
+
+#clock {
+    color: #ffffff;
+    font-weight: 600;
+    padding: 0 14px;
+}
+
+#custom-omarchy {
+    font-size: 16px;
+    padding: 0 12px;
+}
+
+/* ---------------------------------------------------------------- */
+/* Network / audio / battery states                                  */
+/* ---------------------------------------------------------------- */
+
+#network.disconnected {
+    color: rgba(255, 255, 255, 0.40);
+}
+
+#pulseaudio.muted {
+    color: rgba(255, 255, 255, 0.45);
+}
+
+#battery.warning {
+    color: #ff9f0a;
+}
+
+#battery.critical {
+    color: #ff453a;
+}
+
+#battery.charging {
+    color: #ffffff;
+}
+
+#cpu.warning {
+    color: #ff9f0a;
+}
+
+/* ---------------------------------------------------------------- */
+/* Tray expander                                                     */
+/* ---------------------------------------------------------------- */
+
+#tray {
+    padding: 0 6px;
+}
+
+#tray > .passive {
+    -gtk-icon-effect: dim;
+}
+
+#tray > .needs-attention {
+    background-color: rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
+}

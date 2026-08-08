@@ -28,7 +28,7 @@ const log = @import("../core/log.zig");
 // State
 // ---------------------------------------------------------------------------
 
-const Mode = enum { idle, music, notif, osd, screenshot };
+const Mode = enum { idle, music, music_min, notif, osd, screenshot };
 
 var island_win: ?*anyopaque = null;
 var root_box: ?*anyopaque = null;
@@ -49,6 +49,15 @@ var music_play_btn: ?*anyopaque = null;
 var music_prev_btn: ?*anyopaque = null;
 var music_next_btn: ?*anyopaque = null;
 var music_progress_bar: ?*anyopaque = null;
+var music_pos_label: ?*anyopaque = null;
+var music_remain_label: ?*anyopaque = null;
+var music_airplay_btn: ?*anyopaque = null;
+
+// Compact music mode — spinning round cover pill (hover to expand)
+var min_box: ?*anyopaque = null;
+var min_art_image: ?*anyopaque = null;
+var shrink_timer: c_uint = 0;
+var hovering = false;
 
 // Notification section
 var notif_box: ?*anyopaque = null;
@@ -94,7 +103,9 @@ var last_battery_charging = false;
 const IDLE_W: c_int = 200;
 const IDLE_H: c_int = 40;
 const EXPANDED_W: c_int = 440;
-const EXPANDED_H: c_int = 118;
+const EXPANDED_H: c_int = 136;
+const MIN_W: c_int = 64;
+const MIN_H: c_int = 64;
 
 // ---------------------------------------------------------------------------
 // CSS — the island ships its own stylesheet so it looks right even before the
@@ -102,31 +113,29 @@ const EXPANDED_H: c_int = 118;
 // ---------------------------------------------------------------------------
 
 const island_css =
+    \\/* OpenAI black/white: solid dark pill, no gradients, hairline border. */
     \\#dockh-island {
-    \\    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 38%),
-    \\                      linear-gradient(180deg, rgba(24, 27, 34, 0.97), rgba(11, 13, 18, 0.97));
-    \\    border: 1px solid rgba(255, 255, 255, 0.13);
+    \\    background-color: #0a0a0c;
+    \\    border: 1px solid rgba(255, 255, 255, 0.12);
     \\    border-radius: 999px;
-    \\    box-shadow: 0 14px 44px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(0, 0, 0, 0.35),
-    \\                inset 0 1px 0 rgba(255, 255, 255, 0.10);
+    \\    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.55);
     \\    transition: all 280ms cubic-bezier(0.34, 1.4, 0.64, 1);
     \\}
     \\#dockh-island.expanded {
-    \\    border-radius: 26px;
-    \\    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 30%),
-    \\                      linear-gradient(180deg, rgba(26, 29, 37, 0.98), rgba(13, 15, 21, 0.98));
+    \\    border-radius: 24px;
     \\}
     \\
     \\@keyframes island-pop {
     \\    from { opacity: 0; }
     \\    to   { opacity: 1; }
     \\}
-    \\#island-music.show, #island-notif.show, #island-osd.show {
+    \\#island-music.show, #island-notif.show, #island-osd.show,
+    \\#island-shot.show, #island-music-min.show {
     \\    animation: island-pop 220ms ease-out;
     \\}
     \\
     \\#island-clock {
-    \\    color: #f2f4f8;
+    \\    color: #ffffff;
     \\    font-weight: 600;
     \\    font-size: 14px;
     \\    letter-spacing: 0.5px;
@@ -149,8 +158,7 @@ const island_css =
     \\#island-art-wrap {
     \\    border-radius: 12px;
     \\    background-color: rgba(255, 255, 255, 0.08);
-    \\    border: 1px solid rgba(255, 255, 255, 0.08);
-    \\    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+    \\    border: 1px solid rgba(255, 255, 255, 0.10);
     \\}
     \\#island-song-title {
     \\    color: #ffffff;
@@ -162,7 +170,36 @@ const island_css =
     \\    font-size: 12px;
     \\}
     \\
-    \\#island-music-controls button, #island-shot-controls button {
+    \\/* Animated equalizer next to the artist (opacity pulse, GTK-safe). */
+    \\#island-viz {
+    \\    margin-top: 2px;
+    \\}
+    \\#island-viz-bar {
+    \\    min-width: 3px;
+    \\    min-height: 12px;
+    \\    background-color: rgba(255, 255, 255, 0.85);
+    \\    border-radius: 2px;
+    \\    animation: island-viz 1.1s ease-in-out infinite;
+    \\}
+    \\#island-viz-bar:nth-child(1) { animation-delay: 0ms; }
+    \\#island-viz-bar:nth-child(2) { animation-delay: 220ms; }
+    \\#island-viz-bar:nth-child(3) { animation-delay: 440ms; }
+    \\#island-viz-bar:nth-child(4) { animation-delay: 660ms; }
+    \\@keyframes island-viz {
+    \\    0%, 100% { opacity: 0.25; }
+    \\    50%      { opacity: 1; }
+    \\}
+    \\
+    \\#island-time {
+    \\    color: rgba(255, 255, 255, 0.65);
+    \\    font-size: 11px;
+    \\    font-variant-numeric: tabular-nums;
+    \\}
+    \\#island-time.remaining {
+    \\    color: rgba(255, 255, 255, 0.45);
+    \\}
+    \\
+    \\#island-music-controls button, #island-shot-controls button, #island-airplay-btn {
     \\    background-color: transparent;
     \\    background-image: none;
     \\    border: none;
@@ -174,7 +211,7 @@ const island_css =
     \\    padding: 4px;
     \\    transition: background-color 140ms ease;
     \\}
-    \\#island-music-controls button:hover, #island-shot-controls button:hover {
+    \\#island-music-controls button:hover, #island-shot-controls button:hover, #island-airplay-btn:hover {
     \\    background-color: rgba(255, 255, 255, 0.12);
     \\}
     \\#island-music-controls #island-play-btn {
@@ -186,12 +223,11 @@ const island_css =
     \\
     \\#island-progress {
     \\    min-height: 3px;
-    \\    margin: 10px 0 2px 0;
-    \\    background-color: rgba(255, 255, 255, 0.10);
+    \\    background-color: rgba(255, 255, 255, 0.14);
     \\    border-radius: 999px;
     \\}
     \\#island-progress > trough > progress {
-    \\    background-color: #5ac8fa;
+    \\    background-color: #e8e8ea;
     \\    border-radius: 999px;
     \\    min-height: 3px;
     \\}
@@ -200,7 +236,7 @@ const island_css =
     \\    border-radius: 10px;
     \\}
     \\#island-notif-app {
-    \\    color: #5ac8fa;
+    \\    color: rgba(255, 255, 255, 0.75);
     \\    font-size: 10px;
     \\    font-weight: 700;
     \\    text-transform: uppercase;
@@ -225,11 +261,11 @@ const island_css =
     \\#island-osd-progress {
     \\    min-height: 6px;
     \\    margin: 8px 0 2px 0;
-    \\    background-color: rgba(255, 255, 255, 0.10);
+    \\    background-color: rgba(255, 255, 255, 0.14);
     \\    border-radius: 999px;
     \\}
     \\#island-osd-progress > trough > progress {
-    \\    background-color: #5ac8fa;
+    \\    background-color: #e8e8ea;
     \\    border-radius: 999px;
     \\    min-height: 6px;
     \\}
@@ -238,7 +274,6 @@ const island_css =
     \\    border-radius: 12px;
     \\    background-color: rgba(255, 255, 255, 0.06);
     \\    border: 1px solid rgba(255, 255, 255, 0.10);
-    \\    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
     \\}
     \\#island-shot-title {
     \\    color: #ffffff;
@@ -248,6 +283,24 @@ const island_css =
     \\#island-shot-body {
     \\    color: rgba(255, 255, 255, 0.55);
     \\    font-size: 12px;
+    \\}
+    \\
+    \\/* Compact music pill: 100% round cover spinning like a vinyl. */
+    \\#island-music-min {
+    \\    background-color: #0a0a0c;
+    \\    border: 1px solid rgba(255, 255, 255, 0.12);
+    \\    border-radius: 999px;
+    \\}
+    \\#island-min-art {
+    \\    border-radius: 999px;
+    \\    animation: island-spin 8s linear infinite;
+    \\}
+    \\#island-music-min.paused #island-min-art {
+    \\    animation-play-state: paused;
+    \\}
+    \\@keyframes island-spin {
+    \\    from { transform: rotate(0deg); }
+    \\    to   { transform: rotate(360deg); }
     \\}
 ;
 
@@ -393,9 +446,7 @@ fn createIdleSection() ?*anyopaque {
     c.gtk_widget_set_visible(battery_label, 0);
     c.gtk_box_append(box, battery_label);
     return box;
-}
-
-fn createMusicSection() ?*anyopaque {
+}fn createMusicSection() ?*anyopaque {
     const box = c.gtk_box_new(c.ORIENTATION_VERTICAL, 0);
     music_box = box;
     c.gtk_widget_set_name(box, "island-music");
@@ -404,10 +455,10 @@ fn createMusicSection() ?*anyopaque {
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
     c.gtk_widget_set_hexpand(box, 1);
 
-    // content row: art | info(+controls)
-    const row = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 14);
-    c.gtk_widget_set_halign(row, c.ALIGN_CENTER);
-    c.gtk_widget_set_valign(row, c.ALIGN_CENTER);
+    // top row: art | title / artist (+ equalizer)
+    const row_top = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 14);
+    c.gtk_widget_set_halign(row_top, c.ALIGN_CENTER);
+    c.gtk_widget_set_valign(row_top, c.ALIGN_CENTER);
 
     // album art, wrapped for rounded clipping
     art_wrap = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
@@ -419,30 +470,69 @@ fn createMusicSection() ?*anyopaque {
     // theme fallback)
     setImageIcon(art_image, "island-album-placeholder", "audio-x-generic-symbolic", 24);
     c.gtk_box_append(art_wrap, art_image);
-    c.gtk_box_append(row, art_wrap);
+    c.gtk_box_append(row_top, art_wrap);
 
-    // info + controls
-    const mid = c.gtk_box_new(c.ORIENTATION_VERTICAL, 6);
+    // middle column: title, then artist + animated equalizer
+    const mid = c.gtk_box_new(c.ORIENTATION_VERTICAL, 4);
     c.gtk_widget_set_valign(mid, c.ALIGN_CENTER);
+    c.gtk_widget_set_hexpand(mid, 1);
 
-    const info = c.gtk_box_new(c.ORIENTATION_VERTICAL, 1);
     music_title_label = c.gtk_label_new("");
     c.gtk_widget_set_name(music_title_label, "island-song-title");
     c.gtk_widget_set_halign(music_title_label, c.ALIGN_START);
     c.gtk_label_set_ellipsize(music_title_label, c.PANGO_ELLIPSIZE_END);
-    c.gtk_box_append(info, music_title_label);
+    c.gtk_box_append(mid, music_title_label);
 
+    const artist_row = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 8);
+    c.gtk_widget_set_halign(artist_row, c.ALIGN_START);
     music_artist_label = c.gtk_label_new("");
     c.gtk_widget_set_name(music_artist_label, "island-song-artist");
     c.gtk_widget_set_halign(music_artist_label, c.ALIGN_START);
+    c.gtk_widget_set_hexpand(music_artist_label, 1);
     c.gtk_label_set_ellipsize(music_artist_label, c.PANGO_ELLIPSIZE_END);
-    c.gtk_box_append(info, music_artist_label);
-    c.gtk_box_append(mid, info);
+    c.gtk_box_append(artist_row, music_artist_label);
 
-    // controls
+    // animated 4-bar equalizer (opacity pulse, staggered)
+    const viz = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 3);
+    c.gtk_widget_set_name(viz, "island-viz");
+    c.gtk_widget_set_valign(viz, c.ALIGN_CENTER);
+    var vi: usize = 0;
+    while (vi < 4) : (vi += 1) {
+        const bar = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_set_name(bar, "island-viz-bar");
+        c.gtk_box_append(viz, bar);
+    }
+    c.gtk_box_append(artist_row, viz);
+    c.gtk_box_append(mid, artist_row);
+    c.gtk_box_append(row_top, mid);
+    c.gtk_box_append(box, row_top);
+
+    // progress row: current time | bar | remaining time
+    const row_prog = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 8);
+    c.gtk_widget_set_hexpand(row_prog, 1);
+    music_pos_label = c.gtk_label_new("0:00");
+    c.gtk_widget_set_name(music_pos_label, "island-time");
+    c.gtk_box_append(row_prog, music_pos_label);
+
+    music_progress_bar = c.gtk_progress_bar_new();
+    c.gtk_widget_set_name(music_progress_bar, "island-progress");
+    c.gtk_widget_set_hexpand(music_progress_bar, 1);
+    c.gtk_progress_bar_set_fraction(music_progress_bar, 0);
+    c.gtk_progress_bar_set_show_text(music_progress_bar, 0);
+    c.gtk_box_append(row_prog, music_progress_bar);
+
+    music_remain_label = c.gtk_label_new("-0:00");
+    c.gtk_widget_set_name(music_remain_label, "island-time");
+    c.gtk_widget_add_css_class(music_remain_label, "remaining");
+    c.gtk_box_append(row_prog, music_remain_label);
+    c.gtk_box_append(box, row_prog);
+
+    // controls row: centered prev/play/next, airplay at the far end
+    const row_ctl = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 6);
     const controls = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 6);
     c.gtk_widget_set_name(controls, "island-music-controls");
-    c.gtk_widget_set_halign(controls, c.ALIGN_START);
+    c.gtk_widget_set_halign(controls, c.ALIGN_CENTER);
+    c.gtk_widget_set_hexpand(controls, 1);
 
     music_prev_btn = makeIconButton("island-prev", "media-skip-backward-symbolic", 18);
     _ = c.g_signal_connect(music_prev_btn, "clicked", @ptrCast(&onPrevClicked), null);
@@ -457,19 +547,32 @@ fn createMusicSection() ?*anyopaque {
     _ = c.g_signal_connect(music_next_btn, "clicked", @ptrCast(&onNextClicked), null);
     c.gtk_box_append(controls, music_next_btn);
 
-    c.gtk_box_append(mid, controls);
-    c.gtk_box_append(row, mid);
+    c.gtk_box_append(row_ctl, controls);
 
-    c.gtk_box_append(box, row);
+    music_airplay_btn = makeIconButton("island-airplay", "network-wireless-symbolic", 16);
+    c.gtk_widget_set_name(music_airplay_btn, "island-airplay-btn");
+    c.gtk_widget_set_valign(music_airplay_btn, c.ALIGN_CENTER);
+    c.gtk_box_append(row_ctl, music_airplay_btn);
+    c.gtk_box_append(box, row_ctl);
 
-    // progress bar (full width)
-    music_progress_bar = c.gtk_progress_bar_new();
-    c.gtk_widget_set_name(music_progress_bar, "island-progress");
-    c.gtk_widget_set_hexpand(music_progress_bar, 1);
-    c.gtk_progress_bar_set_fraction(music_progress_bar, 0);
-    c.gtk_progress_bar_set_show_text(music_progress_bar, 0);
-    c.gtk_box_append(box, music_progress_bar);
+    return box;
+}
 
+/// Compact music pill: 100% round album cover, spinning like a vinyl.
+/// Shown after a few seconds of playback; hovering it expands the player.
+fn createMinSection() ?*anyopaque {
+    const box = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
+    min_box = box;
+    c.gtk_widget_set_name(box, "island-music-min");
+    c.gtk_widget_set_size_request(box, MIN_W, MIN_H);
+    c.gtk_widget_set_halign(box, c.ALIGN_CENTER);
+    c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
+
+    min_art_image = c.gtk_image_new();
+    c.gtk_widget_set_name(min_art_image, "island-min-art");
+    c.gtk_widget_set_size_request(min_art_image, MIN_W, MIN_H);
+    setImageIcon(min_art_image, "island-album-placeholder", "audio-x-generic-symbolic", 28);
+    c.gtk_box_append(box, min_art_image);
     return box;
 }
 
@@ -638,6 +741,10 @@ fn createIslandWindow() void {
     c.gtk_widget_set_visible(music_box, 0);
     c.gtk_box_append(root_box, music_box);
 
+    _ = createMinSection();
+    c.gtk_widget_set_visible(min_box, 0);
+    c.gtk_box_append(root_box, min_box);
+
     _ = createNotifSection();
     c.gtk_widget_set_visible(notif_box, 0);
     c.gtk_box_append(root_box, notif_box);
@@ -651,6 +758,13 @@ fn createIslandWindow() void {
     c.gtk_box_append(root_box, shot_box);
 
     c.gtk_window_set_child(win, root_box);
+
+    // Hover: the compact spinning pill expands to the full player on hover,
+    // and the full player shrinks back after a few seconds without hover.
+    const motion = c.gtk_event_controller_motion_new();
+    c.gtk_widget_add_controller(win, motion);
+    _ = c.g_signal_connect(motion, "enter", @ptrCast(&onIslandEnter), null);
+    _ = c.g_signal_connect(motion, "leave", @ptrCast(&onIslandLeave), null);
 
     // Always visible from the start: a small pill with the clock.
     c.gtk_widget_show(win);
@@ -666,16 +780,22 @@ fn createIslandWindow() void {
 
 fn setMode(new_mode: Mode) void {
     if (mode == new_mode and island_win != null) return;
+    log.debug("island: mode {} -> {}", .{ mode, new_mode });
     mode = new_mode;
 
     if (island_win) |w| {
-        if (new_mode == .idle) {
-            c.gtk_widget_remove_css_class(w, "expanded");
-            c.gtk_window_set_default_size(w, IDLE_W, IDLE_H);
-        } else {
+        const expanded = new_mode != .idle and new_mode != .music_min;
+        if (expanded) {
             c.gtk_widget_add_css_class(w, "expanded");
             c.gtk_window_set_default_size(w, EXPANDED_W, EXPANDED_H);
+        } else {
+            c.gtk_widget_remove_css_class(w, "expanded");
+            c.gtk_window_set_default_size(w, if (new_mode == .music_min) MIN_W else IDLE_W, if (new_mode == .music_min) MIN_H else IDLE_H);
         }
+        // Behind apps normally (TOP layer = under windows); only transient
+        // pop-outs (notif / osd / screenshot) rise to the overlay layer.
+        const overlay = new_mode == .notif or new_mode == .osd or new_mode == .screenshot;
+        c.gtk_layer_set_layer(w, if (overlay) c.LAYER_OVERLAY else c.LAYER_TOP);
     }
 
     const show_class: [:0]const u8 = "show";
@@ -686,6 +806,10 @@ fn setMode(new_mode: Mode) void {
     if (music_box) |b| {
         c.gtk_widget_set_visible(b, if (new_mode == .music) 1 else 0);
         if (new_mode == .music) c.gtk_widget_add_css_class(b, show_class.ptr) else c.gtk_widget_remove_css_class(b, show_class.ptr);
+    }
+    if (min_box) |b| {
+        c.gtk_widget_set_visible(b, if (new_mode == .music_min) 1 else 0);
+        if (new_mode == .music_min) c.gtk_widget_add_css_class(b, show_class.ptr) else c.gtk_widget_remove_css_class(b, show_class.ptr);
     }
     if (notif_box) |b| {
         c.gtk_widget_set_visible(b, if (new_mode == .notif) 1 else 0);
@@ -700,6 +824,10 @@ fn setMode(new_mode: Mode) void {
         if (new_mode == .screenshot) c.gtk_widget_add_css_class(b, show_class.ptr) else c.gtk_widget_remove_css_class(b, show_class.ptr);
     }
 
+    // Auto-shrink: the full player collapses to the spinning cover after a
+    // few seconds of no hover; any other mode cancels that plan.
+    if (new_mode == .music) startShrinkTimer() else cancelShrinkTimer();
+
     recenter();
 }
 
@@ -710,8 +838,46 @@ fn cancelNotifTimer() void {
     }
 }
 
+fn cancelShrinkTimer() void {
+    if (shrink_timer != 0) {
+        _ = c.g_source_remove(shrink_timer);
+        shrink_timer = 0;
+    }
+}
+
+fn onShrinkTimeout(_: ?*anyopaque) callconv(.c) c_int {
+    shrink_timer = 0;
+    log.debug("island: shrink tick (mode={}, hovering={})", .{ mode, hovering });
+    if (mode == .music and !hovering) setMode(.music_min);
+    return 0;
+}
+
+/// Schedule the full player → spinning cover collapse, unless the pointer is
+/// already resting on the island (then it stays expanded).
+fn startShrinkTimer() void {
+    cancelShrinkTimer();
+    if (mode != .music or hovering) return;
+    shrink_timer = c.g_timeout_add(4000, @ptrCast(&onShrinkTimeout), null);
+}
+
+fn onIslandEnter(_: ?*anyopaque, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
+    hovering = true;
+    log.debug("island: hover enter (mode={})", .{mode});
+    if (mode == .music_min) {
+        setMode(.music); // hover the vinyl → full player
+    } else if (mode == .music) {
+        startShrinkTimer(); // keep it open while hovering
+    }
+}
+
+fn onIslandLeave(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    hovering = false;
+    log.debug("island: hover leave (mode={})", .{mode});
+    if (mode == .music) startShrinkTimer(); // shrink again after the delay
+}
+
 fn returnToPrev() void {
-    // Return to music if a track is still playing, else the idle pill.
+    // Return to the player if a track is still playing, else the idle pill.
     if (was_playing) setMode(.music) else setMode(.idle);
 }
 
@@ -898,6 +1064,25 @@ fn spawnArtDownload(url: []const u8, cache: []const u8) void {
     spawnArgv(&.{ "sh", "-c", cmd[0..pos :0] });
 }
 
+/// Apply an image FILE to both the big player art and the compact cover.
+/// `z_path` must be NUL-terminated (callers dupeZ first).
+fn applyArtFile(z_path: [*:0]const u8, px: c_int) void {
+    if (art_image) |i| {
+        c.gtk_image_set_from_file(i, z_path);
+        c.gtk_image_set_pixel_size(i, px);
+    }
+    if (min_art_image) |i| {
+        c.gtk_image_set_from_file(i, z_path);
+        c.gtk_image_set_pixel_size(i, MIN_W);
+    }
+}
+
+/// Apply the SVG/theme placeholder icon to both art widgets.
+fn applyArtIcon(svg_name: []const u8, fallback_icon: []const u8, px: c_int) void {
+    if (art_image) |i| setImageIcon(i, svg_name, fallback_icon, px);
+    if (min_art_image) |i| setImageIcon(i, svg_name, fallback_icon, MIN_W - 8);
+}
+
 /// Show the cached art unless it's already displayed (the 1s poll calls this
 /// every tick — the `last_art_file` guard stops GTK from re-decoding the
 /// image 60×/min). Ignores a missing or empty cache file.
@@ -908,8 +1093,7 @@ fn loadArtCache(cache: []const u8) bool {
     last_art_file = state.alloc.dupe(u8, cache) catch return false;
     log.info("island: album art loaded ({s})", .{cache});
     const z = state.alloc.dupeZ(u8, cache) catch return false;
-    c.gtk_image_set_from_file(art_image, z.ptr);
-    c.gtk_image_set_pixel_size(art_image, 56);
+    applyArtFile(z.ptr, 56);
     return true;
 }
 
@@ -963,13 +1147,12 @@ fn setAlbumArt(path: []const u8) bool {
         // slice lives in status.zig's scratch buffer.
         last_art_path = state.alloc.dupe(u8, path) catch return false;
         const z = state.alloc.dupeZ(u8, p) catch return false;
-        c.gtk_image_set_from_file(art_image, z.ptr);
-        c.gtk_image_set_pixel_size(art_image, 56);
+        applyArtFile(z.ptr, 56);
         return true;
     }
     // Empty or non-file: reset to the placeholder.
     last_art_path = "";
-    setImageIcon(art_image, "island-album-placeholder", "audio-x-generic-symbolic", 24);
+    applyArtIcon("island-album-placeholder", "audio-x-generic-symbolic", 24);
     return true;
 }
 
@@ -981,7 +1164,7 @@ pub fn updateMusic(title: []const u8, artist: []const u8, status: []const u8, al
 
     const playing = std.mem.eql(u8, status, "Playing");
     const has_track = title.len > 0 or playing;
-
+    const resumed = playing and !last_playing; // pop out again on play
     // Refresh labels only when they actually change (avoids per-second
     // arena churn from the 1s playerctl poll). Keep owned copies.
     if (music_title_label) |lbl| {
@@ -1016,26 +1199,65 @@ pub fn updateMusic(title: []const u8, artist: []const u8, status: []const u8, al
         }
     }
 
-    // Transient modes (notif/osd) keep the stage until their timer fires —
-    // the music data updates underneath them.
-    if (mode == .notif or mode == .osd) {
+    // The compact vinyl stops spinning while paused (macOS behavior).
+    if (min_box) |b| {
+        if (playing) {
+            c.gtk_widget_remove_css_class(b, "paused");
+        } else {
+            c.gtk_widget_add_css_class(b, "paused");
+        }
+    }
+
+    // Transient modes (notif/osd/screenshot) keep the stage until their timer
+    // fires — the music data updates underneath them.
+    if (mode == .notif or mode == .osd or mode == .screenshot) {
         was_playing = playing;
         return;
     }
     if (has_track) {
         was_playing = playing;
-        if (mode != .music) setMode(.music);
-    } else if (mode == .music and !playing) {
+        // Full player or compact vinyl — never force-expand from the compact
+        // pill back to the big player just because the 1s poll fired, unless
+        // playback just resumed (macOS pops the widget out on play).
+        if (resumed or (mode != .music and mode != .music_min)) setMode(.music);
+    } else if ((mode == .music or mode == .music_min) and !playing) {
         was_playing = false;
         setMode(.idle);
     }
 }
 
-/// Update the music progress bar (0.0 – 1.0).
-pub fn updateMusicProgress(fraction: f64) void {
+/// m:ss time formatting into `buf`; returns "" when it doesn't fit.
+fn fmtTime(secs: f64, buf: []u8) []const u8 {
+    const s = @max(0, @as(i64, @intFromFloat(secs)));
+    const m = s / 60;
+    const ss = s % 60;
+    return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ m, ss }) catch "";
+}
+
+/// Update the music progress bar + the current/remaining time labels.
+/// `pos_us` / `len_us` are MPRIS values in MICROSECONDS (playerctl emits µs
+/// for {{position}} — dividing naively produced an always-full bar).
+pub fn updateMusicProgress(pos_us: f64, len_us: f64) void {
     if (!state.cfg.island_enabled) return;
+    const len_s = len_us / 1_000_000.0;
+    const pos_s = pos_us / 1_000_000.0;
+    const fraction = if (len_s > 0) @max(0.0, @min(1.0, pos_s / len_s)) else 0;
     if (music_progress_bar) |bar| {
-        c.gtk_progress_bar_set_fraction(bar, @max(0.0, @min(1.0, fraction)));
+        c.gtk_progress_bar_set_fraction(bar, fraction);
+    }
+    var b1: [16]u8 = undefined;
+    var b2: [16]u8 = undefined;
+    if (music_pos_label) |lbl| {
+        const t = fmtTime(pos_s, &b1);
+        const z = state.alloc.dupeZ(u8, t) catch return;
+        c.gtk_label_set_text(lbl, z.ptr);
+    }
+    if (music_remain_label) |lbl| {
+        const t = fmtTime(len_s - pos_s, &b2); // positive remaining
+        var mbuf: [32]u8 = undefined;
+        const m = std.fmt.bufPrint(&mbuf, "-{s}", .{t}) catch "";
+        const z = state.alloc.dupeZ(u8, m) catch return;
+        c.gtk_label_set_text(lbl, z.ptr);
     }
 }
 
@@ -1083,7 +1305,7 @@ pub fn showNotification(app: []const u8, icon: []const u8, title_text: []const u
         }
     }
 
-    was_playing = mode == .music;
+    was_playing = mode == .music or mode == .music_min;
     setMode(.notif);
     cancelNotifTimer();
     notif_timer = c.g_timeout_add(5000, @ptrCast(&onNotifTimeout), null);
@@ -1115,7 +1337,7 @@ pub fn showOsd(icon: []const u8, title_text: []const u8, fraction: f64) void {
         c.gtk_progress_bar_set_fraction(bar, @max(0.0, @min(1.0, fraction)));
     }
 
-    was_playing = mode == .music;
+    was_playing = mode == .music or mode == .music_min;
     setMode(.osd);
     cancelNotifTimer();
     notif_timer = c.g_timeout_add(1500, @ptrCast(&onNotifTimeout), null);
@@ -1197,7 +1419,7 @@ pub fn showScreenshot(path: []const u8) void {
         c.gtk_image_set_pixel_size(img, 96);
     }
 
-    was_playing = mode == .music;
+    was_playing = mode == .music or mode == .music_min;
     setMode(.screenshot);
     cancelNotifTimer();
     notif_timer = c.g_timeout_add(6000, @ptrCast(&onNotifTimeout), null);
@@ -1250,6 +1472,7 @@ pub fn setBattery(pct: i32, charging: bool, present: bool) void {
 /// Tear down timers. The window is destroyed with the process.
 pub fn deinit() void {
     cancelNotifTimer();
+    cancelShrinkTimer();
     if (clock_timer != 0) {
         _ = c.g_source_remove(clock_timer);
         clock_timer = 0;

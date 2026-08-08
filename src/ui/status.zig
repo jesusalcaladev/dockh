@@ -113,10 +113,10 @@ fn pollProgress() void {
         widgets.setProgress("", 0);
         return;
     }
-    const fraction = @max(0.0, @min(1.0, pos / (len_us / 1_000_000.0)));
+    const fraction = @max(0.0, @min(1.0, pos / len_us)); // both in µs
 
-    // Update island progress bar
-    island.updateMusicProgress(fraction);
+    // Update island progress bar + current/remaining time labels
+    island.updateMusicProgress(pos, len_us);
 
     // Show the bar on the app that owns the player
     var target = entry;
