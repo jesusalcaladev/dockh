@@ -1,19 +1,15 @@
 //! dockh-config — graphical editor for ~/.config/dockh/config.toml.
 //!
 //! A regular GTK4 window (NOT a layer shell) with a GtkNotebook of tabs:
-//!   Apariencia · Comportamiento · Widgets · Glass · Apps · Memoria
+//!   General · Behavior · Widgets · Apps
 //! Every option is a form control (GtkSwitch / GtkSpinButton / GtkEntry /
 //! GtkDropDown). Save writes the file TEXTUALLY through config.setValueInText
 //! — comments, indentation and every untouched key survive — and the running
 //! dock hot-reloads config.toml on its own (main.zig watches the file with a
-//! GFileMonitor and re-execs itself), so editing here is applied live.
+//! GFileMonitor and re-executes itself), so editing here is applied live.
 //!
-//! The [apps] pinned list is special: the dock's runtime truth lives in
-//! ~/.cache/dockh/pinned (one class per line), which wins over the TOML
-//! seed. This editor reads it from the cache file and writes both.
+//! Supports English / Spanish with a language toggle in the header bar.
 const std = @import("std");
-// Named imports wired up in build.zig (the module is rooted in src/config-gui/
-// so ../ relative imports would leave its path):
 const c = @import("c");
 const config_mod = @import("cfg");
 const fs = @import("fs");
@@ -27,50 +23,237 @@ var status_label: ?*anyopaque = null;
 var config_path: []const u8 = "";
 var cfg_override: []const u8 = "";
 var main_loop: ?*anyopaque = null;
-
-// Glass tab: live preview widget + preset dropdown + load guard (the
-// dropdown's notify::selected also fires when loadValues() resets it, and
-// must not re-apply a preset over freshly loaded values).
-var glass_preview: ?*anyopaque = null;
-var glass_preset_drop: ?*anyopaque = null;
 var loading_values = false;
 
-// Glass presets — one click sets all nine tunable shader knobs. The names
-// follow the optical feel: Light (barely there), Frost (heavy blur),
-// Spray (chromatic rainbow edges), Liquid (strong refraction + splay),
-// Deep (dark tinted panel).
-const GlassPreset = struct {
-    name: []const u8,
-    radius: f64,
-    margin: f64,
-    refraction: f64,
-    dispersion: f64,
-    splay: f64,
-    frost: f64,
-    depth: f64,
-    light_angle: f64,
-    alpha: f64,
+// ---------------------------------------------------------------------------
+// i18n — English / Spanish translations
+// ---------------------------------------------------------------------------
+
+const Lang = enum { en, es };
+var current_lang: Lang = .en;
+
+const TabKey = enum { general, behavior, widgets, apps };
+
+const I18n = struct {
+    // Tab names
+    tab_general: []const u8,
+    tab_behavior: []const u8,
+    tab_widgets: []const u8,
+    tab_apps: []const u8,
+    // Section headers
+    sec_dock: []const u8,
+    sec_margins: []const u8,
+    sec_launcher: []const u8,
+    sec_hotspot: []const u8,
+    sec_animation: []const u8,
+    sec_magnify: []const u8,
+    sec_island: []const u8,
+    sec_progress: []const u8,
+    sec_badge: []const u8,
+    sec_system: []const u8,
+    // Field labels
+    lbl_position: []const u8,
+    lbl_alignment: []const u8,
+    lbl_full: []const u8,
+    lbl_layer: []const u8,
+    lbl_exclusive: []const u8,
+    lbl_icon_size: []const u8,
+    lbl_workspaces: []const u8,
+    lbl_target_output: []const u8,
+    lbl_margin_top: []const u8,
+    lbl_margin_bottom: []const u8,
+    lbl_margin_left: []const u8,
+    lbl_margin_right: []const u8,
+    lbl_show_launcher: []const u8,
+    lbl_launcher_cmd: []const u8,
+    lbl_launcher_icon: []const u8,
+    lbl_launcher_pos: []const u8,
+    lbl_autohide: []const u8,
+    lbl_intelli_hide: []const u8,
+    lbl_resident: []const u8,
+    lbl_hotspot_delay: []const u8,
+    lbl_hotspot_layer: []const u8,
+    lbl_hotspot_size: []const u8,
+    lbl_magnify_scale: []const u8,
+    lbl_transition: []const u8,
+    lbl_ease_curve: []const u8,
+    lbl_magnify_enabled: []const u8,
+    lbl_spread: []const u8,
+    lbl_falloff: []const u8,
+    lbl_steps: []const u8,
+    lbl_ease_time: []const u8,
+    lbl_spring: []const u8,
+    lbl_spring_strength: []const u8,
+    lbl_island: []const u8,
+    lbl_progress: []const u8,
+    lbl_badge: []const u8,
+    lbl_badge_threshold: []const u8,
+    lbl_sys_monitor: []const u8,
+    lbl_sys_dock: []const u8,
+    lbl_sys_interval: []const u8,
+    lbl_sys_ram: []const u8,
+    lbl_sys_cpu: []const u8,
+    lbl_sys_temp: []const u8,
+    lbl_css_file: []const u8,
+    lbl_pinned: []const u8,
+    lbl_ignore_classes: []const u8,
+    lbl_ignore_ws: []const u8,
+    // UI
+    lbl_save: []const u8,
+    lbl_saved: []const u8,
+    lbl_icon_preview: []const u8,
+    lbl_lang_toggle: []const u8,
 };
 
-const glass_presets = [_]GlassPreset{
-    .{ .name = "Light", .radius = 24, .margin = 10, .refraction = 0.30, .dispersion = 0.08, .splay = 0.35, .frost = 0.10, .depth = 0.08, .light_angle = -45, .alpha = 0.92 },
-    .{ .name = "Frost", .radius = 26, .margin = 12, .refraction = 0.35, .dispersion = 0.12, .splay = 0.45, .frost = 0.65, .depth = 0.12, .light_angle = -45, .alpha = 0.88 },
-    .{ .name = "Spray", .radius = 22, .margin = 8, .refraction = 0.55, .dispersion = 0.55, .splay = 0.75, .frost = 0.25, .depth = 0.20, .light_angle = -60, .alpha = 0.85 },
-    .{ .name = "Liquid", .radius = 20, .margin = 6, .refraction = 0.80, .dispersion = 0.30, .splay = 0.90, .frost = 0.15, .depth = 0.28, .light_angle = -30, .alpha = 0.82 },
-    .{ .name = "Deep", .radius = 16, .margin = 4, .refraction = 0.95, .dispersion = 0.45, .splay = 0.85, .frost = 0.10, .depth = 0.60, .light_angle = -15, .alpha = 0.72 },
+const en = I18n{
+    .tab_general = "General",
+    .tab_behavior = "Behavior",
+    .tab_widgets = "Widgets",
+    .tab_apps = "Apps",
+    .sec_dock = "Dock",
+    .sec_margins = "Margins",
+    .sec_launcher = "Launcher",
+    .sec_hotspot = "Hotspot",
+    .sec_animation = "Animation",
+    .sec_magnify = "Magnify",
+    .sec_island = "Dynamic Island",
+    .sec_progress = "Progress",
+    .sec_badge = "Badge",
+    .sec_system = "System Monitor",
+    .lbl_position = "Position",
+    .lbl_alignment = "Alignment",
+    .lbl_full = "Full width / height",
+    .lbl_layer = "Layer",
+    .lbl_exclusive = "Exclusive zone",
+    .lbl_icon_size = "Icon size (px)",
+    .lbl_workspaces = "Workspaces",
+    .lbl_target_output = "Target output",
+    .lbl_margin_top = "Margin top (px)",
+    .lbl_margin_bottom = "Margin bottom (px)",
+    .lbl_margin_left = "Margin left (px)",
+    .lbl_margin_right = "Margin right (px)",
+    .lbl_show_launcher = "Show launcher",
+    .lbl_launcher_cmd = "Launcher command",
+    .lbl_launcher_icon = "Launcher icon",
+    .lbl_launcher_pos = "Launcher position",
+    .lbl_autohide = "Auto-hide",
+    .lbl_intelli_hide = "Intelli-hide",
+    .lbl_resident = "Always visible",
+    .lbl_hotspot_delay = "Hotspot delay (ms)",
+    .lbl_hotspot_layer = "Hotspot layer",
+    .lbl_hotspot_size = "Hotspot size (px)",
+    .lbl_magnify_scale = "Magnify scale",
+    .lbl_transition = "Transition (ms)",
+    .lbl_ease_curve = "Ease curve",
+    .lbl_magnify_enabled = "Magnify on hover",
+    .lbl_spread = "Spread (slots)",
+    .lbl_falloff = "Curve sharpness",
+    .lbl_steps = "Bucket steps",
+    .lbl_ease_time = "Ease time (ms)",
+    .lbl_spring = "Settle spring",
+    .lbl_spring_strength = "Spring strength",
+    .lbl_island = "Dynamic Island",
+    .lbl_progress = "Media progress bar",
+    .lbl_badge = "Notification badge",
+    .lbl_badge_threshold = "Badge high threshold",
+    .lbl_sys_monitor = "System monitor (menu)",
+    .lbl_sys_dock = "System pill in dock",
+    .lbl_sys_interval = "Poll interval (ms)",
+    .lbl_sys_ram = "Show RAM",
+    .lbl_sys_cpu = "Show CPU",
+    .lbl_sys_temp = "Show temperature",
+    .lbl_css_file = "Stylesheet file",
+    .lbl_pinned = "Pinned apps",
+    .lbl_ignore_classes = "Ignored classes",
+    .lbl_ignore_ws = "Ignored workspaces",
+    .lbl_save = "Save",
+    .lbl_saved = "Saved — dock applies it now",
+    .lbl_icon_preview = "Icon preview",
+    .lbl_lang_toggle = "ES",
 };
+
+const es = I18n{
+    .tab_general = "General",
+    .tab_behavior = "Comportamiento",
+    .tab_widgets = "Widgets",
+    .tab_apps = "Aplicaciones",
+    .sec_dock = "Dock",
+    .sec_margins = "Márgenes",
+    .sec_launcher = "Lanzador",
+    .sec_hotspot = "Hotspot",
+    .sec_animation = "Animación",
+    .sec_magnify = "Magnificación",
+    .sec_island = "Isla Dinámica",
+    .sec_progress = "Progreso",
+    .sec_badge = "Insignia",
+    .sec_system = "Monitor del Sistema",
+    .lbl_position = "Posición",
+    .lbl_alignment = "Alineación",
+    .lbl_full = "Ancho / alto completo",
+    .lbl_layer = "Capa",
+    .lbl_exclusive = "Zona exclusiva",
+    .lbl_icon_size = "Tamaño de icono (px)",
+    .lbl_workspaces = "Espacios de trabajo",
+    .lbl_target_output = "Salida destino",
+    .lbl_margin_top = "Margen superior (px)",
+    .lbl_margin_bottom = "Margen inferior (px)",
+    .lbl_margin_left = "Margen izquierdo (px)",
+    .lbl_margin_right = "Margen derecho (px)",
+    .lbl_show_launcher = "Mostrar lanzador",
+    .lbl_launcher_cmd = "Comando del lanzador",
+    .lbl_launcher_icon = "Icono del lanzador",
+    .lbl_launcher_pos = "Posición del lanzador",
+    .lbl_autohide = "Auto-ocultar",
+    .lbl_intelli_hide = "Inteli-ocultar",
+    .lbl_resident = "Siempre visible",
+    .lbl_hotspot_delay = "Retraso hotspot (ms)",
+    .lbl_hotspot_layer = "Capa hotspot",
+    .lbl_hotspot_size = "Tamaño hotspot (px)",
+    .lbl_magnify_scale = "Escala de magnificación",
+    .lbl_transition = "Transición (ms)",
+    .lbl_ease_curve = "Curva de ease",
+    .lbl_magnify_enabled = "Magnificar al pasar",
+    .lbl_spread = "Extensión (slots)",
+    .lbl_falloff = "Nitidez de curva",
+    .lbl_steps = "Pasos de escalera",
+    .lbl_ease_time = "Tiempo de ease (ms)",
+    .lbl_spring = "Resorte de asentamiento",
+    .lbl_spring_strength = "Fuerza del resorte",
+    .lbl_island = "Isla Dinámica",
+    .lbl_progress = "Barra de progreso",
+    .lbl_badge = "Insignia de notificaciones",
+    .lbl_badge_threshold = "Umbral de insignia",
+    .lbl_sys_monitor = "Monitor del sistema (menú)",
+    .lbl_sys_dock = "Píldora en el dock",
+    .lbl_sys_interval = "Intervalo de sondeo (ms)",
+    .lbl_sys_ram = "Mostrar RAM",
+    .lbl_sys_cpu = "Mostrar CPU",
+    .lbl_sys_temp = "Mostrar temperatura",
+    .lbl_css_file = "Archivo de estilos",
+    .lbl_pinned = "Apps fijadas",
+    .lbl_ignore_classes = "Clases ignoradas",
+    .lbl_ignore_ws = "Espacios ignorados",
+    .lbl_save = "Guardar",
+    .lbl_saved = "Guardado — el dock se aplica ahora",
+    .lbl_icon_preview = "Vista previa del icono",
+    .lbl_lang_toggle = "EN",
+};
+
+fn i18n() I18n {
+    return if (current_lang == .es) es else en;
+}
 
 // ---------------------------------------------------------------------------
 // Field table: every config option the editor knows, grouped by tab.
 // ---------------------------------------------------------------------------
 
-const Kind = enum { boolean, integer, float, string, en, list };
+const Kind = enum { boolean, integer, float, string, en_opt, list };
 
 const Field = struct {
-    tab: u8, // 0 Apariencia, 1 Comportamiento, 2 Widgets, 3 Glass, 4 Apps, 5 Memoria
+    tab: TabKey,
     section: []const u8,
     key: []const u8,
-    label: []const u8,
+    label_key: []const u8, // key into I18n for the label
     kind: Kind,
     options: []const []const u8 = &.{},
     min: f64 = 0,
@@ -80,99 +263,221 @@ const Field = struct {
     help: []const u8 = "",
 };
 
-const tab_names = [_][]const u8{ "Apariencia", "Comportamiento", "Widgets", "Glass", "Apps", "Memoria" };
+// Helper to look up the translated label from the i18n struct
+fn getLabel(label_key: []const u8) []const u8 {
+    const il = i18n();
+    const map = .{
+        .{ "position", il.lbl_position },
+        .{ "alignment", il.lbl_alignment },
+        .{ "full", il.lbl_full },
+        .{ "layer", il.lbl_layer },
+        .{ "exclusive", il.lbl_exclusive },
+        .{ "icon_size", il.lbl_icon_size },
+        .{ "workspaces", il.lbl_workspaces },
+        .{ "target_output", il.lbl_target_output },
+        .{ "margin_top", il.lbl_margin_top },
+        .{ "margin_bottom", il.lbl_margin_bottom },
+        .{ "margin_left", il.lbl_margin_left },
+        .{ "margin_right", il.lbl_margin_right },
+        .{ "show_launcher", il.lbl_show_launcher },
+        .{ "launcher_cmd", il.lbl_launcher_cmd },
+        .{ "launcher_icon", il.lbl_launcher_icon },
+        .{ "launcher_pos", il.lbl_launcher_pos },
+        .{ "autohide", il.lbl_autohide },
+        .{ "intelli_hide", il.lbl_intelli_hide },
+        .{ "resident", il.lbl_resident },
+        .{ "hotspot_delay", il.lbl_hotspot_delay },
+        .{ "hotspot_layer", il.lbl_hotspot_layer },
+        .{ "hotspot_size", il.lbl_hotspot_size },
+        .{ "magnify_scale", il.lbl_magnify_scale },
+        .{ "transition", il.lbl_transition },
+        .{ "ease_curve", il.lbl_ease_curve },
+        .{ "magnify_enabled", il.lbl_magnify_enabled },
+        .{ "spread", il.lbl_spread },
+        .{ "falloff", il.lbl_falloff },
+        .{ "steps", il.lbl_steps },
+        .{ "ease_time", il.lbl_ease_time },
+        .{ "spring", il.lbl_spring },
+        .{ "spring_strength", il.lbl_spring_strength },
+        .{ "progress", il.lbl_progress },
+        .{ "badge", il.lbl_badge },
+        .{ "badge_threshold", il.lbl_badge_threshold },
+        .{ "sys_monitor", il.lbl_sys_monitor },
+        .{ "sys_dock", il.lbl_sys_dock },
+        .{ "sys_interval", il.lbl_sys_interval },
+        .{ "sys_ram", il.lbl_sys_ram },
+        .{ "sys_cpu", il.lbl_sys_cpu },
+        .{ "sys_temp", il.lbl_sys_temp },
+        .{ "css_file", il.lbl_css_file },
+        .{ "pinned", il.lbl_pinned },
+        .{ "ignore_classes", il.lbl_ignore_classes },
+        .{ "ignore_ws", il.lbl_ignore_ws },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, label_key, entry[0])) return entry[1];
+    }
+    return label_key;
+}    fn getSection(sec: []const u8) []const u8 {
+    const il = i18n();
+    const map = .{
+        .{ "dock", il.sec_dock },
+        .{ "margins", il.sec_margins },
+        .{ "launcher", il.sec_launcher },
+        .{ "hotspot", il.sec_hotspot },
+        .{ "animation", il.sec_animation },
+        .{ "magnify", il.sec_magnify },
+        .{ "island", il.sec_island },
+        .{ "progress", il.sec_progress },
+        .{ "badge", il.sec_badge },
+        .{ "system", il.sec_system },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, sec, entry[0])) return entry[1];
+    }
+    return sec;
+}
 
 const fields = [_]Field{
-    // ---- 0 · Apariencia: dock ----
-    .{ .tab = 0, .section = "dock", .key = "position", .label = "Position", .kind = .en, .options = &.{ "bottom", "top", "left", "right" }, .help = "Screen edge the dock sits on" },
-    .{ .tab = 0, .section = "dock", .key = "alignment", .label = "Alignment", .kind = .en, .options = &.{ "center", "start", "end" }, .help = "Alignment along the monitor edge (full = off)" },
-    .{ .tab = 0, .section = "dock", .key = "full", .label = "Full width / height", .kind = .boolean, .help = "Take the whole monitor edge" },
-    .{ .tab = 0, .section = "dock", .key = "layer", .label = "Layer", .kind = .en, .options = &.{ "bottom", "top", "overlay" }, .help = "bottom = behind windows, overlay = above everything" },
-    .{ .tab = 0, .section = "dock", .key = "exclusive", .label = "Exclusive zone", .kind = .boolean, .help = "Reserve screen space for the dock (forces top layer)" },
-    .{ .tab = 0, .section = "dock", .key = "icon_size", .label = "Icon size (px)", .kind = .integer, .min = 16, .max = 256, .step = 2, .help = "Base icon size before magnify" },
-    .{ .tab = 0, .section = "dock", .key = "num_workspaces", .label = "Workspaces", .kind = .integer, .min = 1, .max = 20, .step = 1, .help = "Number of workspaces shown in menus" },
-    .{ .tab = 0, .section = "dock", .key = "target_output", .label = "Target output", .kind = .string, .help = "e.g. DP-1 — empty = focused monitor" },
-    // margins
-    .{ .tab = 0, .section = "margins", .key = "top", .label = "Margin top (px)", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    .{ .tab = 0, .section = "margins", .key = "bottom", .label = "Margin bottom (px)", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    .{ .tab = 0, .section = "margins", .key = "left", .label = "Margin left (px)", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    .{ .tab = 0, .section = "margins", .key = "right", .label = "Margin right (px)", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    // launcher
-    .{ .tab = 0, .section = "launcher", .key = "show", .label = "Show launcher button", .kind = .boolean, .help = "App launcher icon at the dock end" },
-    .{ .tab = 0, .section = "launcher", .key = "command", .label = "Launcher command", .kind = .string, .help = "e.g. nwg-drawer" },
-    .{ .tab = 0, .section = "launcher", .key = "icon", .label = "Launcher icon", .kind = .string, .help = "Icon theme name or absolute path" },
-    .{ .tab = 0, .section = "launcher", .key = "position", .label = "Launcher position", .kind = .en, .options = &.{ "end", "start" } },
-    // appearance — injected CSS, hot-reloads live
-    .{ .tab = 0, .section = "appearance", .key = "icon_shadow", .label = "Icon shadow", .kind = .boolean, .help = "Soft drop shadow behind each dock icon (injected into CSS — no style.css editing)" },
-    .{ .tab = 0, .section = "appearance", .key = "icon_shadow_radius", .label = "Shadow blur (px)", .kind = .float, .min = 0, .max = 64, .step = 1, .digits = 0, .help = "Blur radius in whole px (GTK rejects decimals); 0 = sharp edge — only when icon_shadow is on" },
+    // ---- General ----
+    .{ .tab = .general, .section = "dock", .key = "position", .label_key = "position", .kind = .en_opt, .options = &.{ "bottom", "top", "left", "right" } },
+    .{ .tab = .general, .section = "dock", .key = "alignment", .label_key = "alignment", .kind = .en_opt, .options = &.{ "center", "start", "end" } },
+    .{ .tab = .general, .section = "dock", .key = "full", .label_key = "full", .kind = .boolean },
+    .{ .tab = .general, .section = "dock", .key = "layer", .label_key = "layer", .kind = .en_opt, .options = &.{ "bottom", "top", "overlay" } },
+    .{ .tab = .general, .section = "dock", .key = "exclusive", .label_key = "exclusive", .kind = .boolean },
+    .{ .tab = .general, .section = "dock", .key = "icon_size", .label_key = "icon_size", .kind = .integer, .min = 16, .max = 128, .step = 2 },
+    .{ .tab = .general, .section = "dock", .key = "num_workspaces", .label_key = "workspaces", .kind = .integer, .min = 1, .max = 20, .step = 1 },
+    .{ .tab = .general, .section = "dock", .key = "target_output", .label_key = "target_output", .kind = .string },
+    .{ .tab = .general, .section = "margins", .key = "top", .label_key = "margin_top", .kind = .integer, .min = 0, .max = 500, .step = 1 },
+    .{ .tab = .general, .section = "margins", .key = "bottom", .label_key = "margin_bottom", .kind = .integer, .min = 0, .max = 500, .step = 1 },
+    .{ .tab = .general, .section = "margins", .key = "left", .label_key = "margin_left", .kind = .integer, .min = 0, .max = 500, .step = 1 },
+    .{ .tab = .general, .section = "margins", .key = "right", .label_key = "margin_right", .kind = .integer, .min = 0, .max = 500, .step = 1 },
+    .{ .tab = .general, .section = "launcher", .key = "show", .label_key = "show_launcher", .kind = .boolean },
+    .{ .tab = .general, .section = "launcher", .key = "command", .label_key = "launcher_cmd", .kind = .string },
 
-    // ---- 1 · Comportamiento ----
-    .{ .tab = 1, .section = "dock", .key = "autohide", .label = "Auto-hide", .kind = .boolean, .help = "Show on hotspot hover, hide on leave" },
-    .{ .tab = 1, .section = "dock", .key = "hide_on_activity", .label = "Intelli-hide", .kind = .boolean, .help = "Hide while the active workspace has windows" },
-    .{ .tab = 1, .section = "dock", .key = "resident", .label = "Resident (always visible)", .kind = .boolean, .help = "Never auto-hide" },
-    .{ .tab = 1, .section = "hotspot", .key = "delay_ms", .label = "Hotspot delay (ms)", .kind = .integer, .min = 0, .max = 2000, .step = 5, .help = "Flick-to-edge window; 0 = always show" },
-    .{ .tab = 1, .section = "hotspot", .key = "layer", .label = "Hotspot layer", .kind = .en, .options = &.{ "overlay", "top" } },
-    .{ .tab = 1, .section = "hotspot", .key = "size", .label = "Hotspot size (px)", .kind = .integer, .min = 0, .max = 600, .step = 4, .help = "Detector depth; 0 = auto (1/3 of the edge)" },
-    .{ .tab = 1, .section = "animation", .key = "scale", .label = "Magnify scale", .kind = .float, .min = 1.0, .max = 3.0, .step = 0.05, .digits = 2, .help = "Peak hover/magnify scale (macOS drama)" },
-    .{ .tab = 1, .section = "animation", .key = "duration_ms", .label = "Transition (ms)", .kind = .integer, .min = 50, .max = 2000, .step = 10 },
-    .{ .tab = 1, .section = "animation", .key = "curve", .label = "Ease curve", .kind = .string, .help = "cubic-bezier(...) CSS curve" },
+    // ---- Behavior ----
+    .{ .tab = .behavior, .section = "dock", .key = "autohide", .label_key = "autohide", .kind = .boolean },
+    .{ .tab = .behavior, .section = "dock", .key = "hide_on_activity", .label_key = "intelli_hide", .kind = .boolean },
+    .{ .tab = .behavior, .section = "dock", .key = "resident", .label_key = "resident", .kind = .boolean },
+    .{ .tab = .behavior, .section = "hotspot", .key = "delay_ms", .label_key = "hotspot_delay", .kind = .integer, .min = 0, .max = 2000, .step = 5 },
+    .{ .tab = .behavior, .section = "animation", .key = "scale", .label_key = "magnify_scale", .kind = .float, .min = 1.0, .max = 3.0, .step = 0.05, .digits = 2 },
+    .{ .tab = .behavior, .section = "animation", .key = "duration_ms", .label_key = "transition", .kind = .integer, .min = 50, .max = 2000, .step = 10 },
 
-    // ---- 2 · Widgets: magnify ----
-    .{ .tab = 2, .section = "magnify", .key = "enabled", .label = "Magnify on hover", .kind = .boolean, .help = "macOS proximity magnification" },
-    .{ .tab = 2, .section = "magnify", .key = "spread", .label = "Spread (slots)", .kind = .integer, .min = 1, .max = 12, .step = 1, .help = "Effect radius in icon slots from the cursor" },
-    .{ .tab = 2, .section = "magnify", .key = "steps", .label = "Bucket steps", .kind = .integer, .min = 8, .max = 512, .step = 8, .help = "Ladder size: 256 = sub-pixel, smooth" },
-    .{ .tab = 2, .section = "magnify", .key = "duration_ms", .label = "Ease time (ms)", .kind = .integer, .min = 10, .max = 200, .step = 5, .help = "Higher = smoother follow" },
-    .{ .tab = 2, .section = "magnify", .key = "spring", .label = "Settle spring", .kind = .boolean, .help = "macOS settle bounce when the pointer stops" },
-    .{ .tab = 2, .section = "magnify", .key = "spring_strength", .label = "Spring strength", .kind = .float, .min = 0, .max = 0.25, .step = 0.01, .digits = 2 },
-    .{ .tab = 2, .section = "magnify", .key = "click_spring", .label = "Click spring", .kind = .boolean, .help = "Press squash + release bounce on click" },
-    .{ .tab = 2, .section = "magnify", .key = "press_strength", .label = "Press strength", .kind = .float, .min = 0, .max = 0.30, .step = 0.01, .digits = 2 },
-    .{ .tab = 2, .section = "magnify", .key = "release_strength", .label = "Release strength", .kind = .float, .min = 0, .max = 0.50, .step = 0.01, .digits = 2 },
-    .{ .tab = 2, .section = "magnify", .key = "ghost_launch", .label = "Ghost launch", .kind = .boolean, .help = "Bounce + fade when opening a pinned app" },
-    .{ .tab = 2, .section = "magnify", .key = "ghost_ms", .label = "Ghost fade (ms)", .kind = .integer, .min = 150, .max = 2000, .step = 25 },
-    .{ .tab = 2, .section = "magnify", .key = "ghost_scale", .label = "Ghost scale", .kind = .float, .min = 1.0, .max = 2.5, .step = 0.05, .digits = 2 },
-    // progress / badge
-    .{ .tab = 2, .section = "progress", .key = "enabled", .label = "Media progress bar", .kind = .boolean, .help = "macOS-style bar under the playing app (playerctl)" },
-    .{ .tab = 2, .section = "badge", .key = "enabled", .label = "Notification badge", .kind = .boolean, .help = "Notification counter on the app icon (mako)" },
-    .{ .tab = 2, .section = "badge", .key = "threshold", .label = "Badge high threshold", .kind = .integer, .min = 0, .max = 99, .step = 1, .help = "Count at which the badge turns red; 0 = never" },
-    // system monitor
-    .{ .tab = 2, .section = "system", .key = "enabled", .label = "System monitor (menu)", .kind = .boolean, .help = "RAM/CPU/temp in the right-click menu" },
-    .{ .tab = 2, .section = "system", .key = "dock", .label = "System pill in dock", .kind = .boolean, .help = "Always-visible stats at the dock end (opt-in)" },
-    .{ .tab = 2, .section = "system", .key = "interval_ms", .label = "Poll interval (ms)", .kind = .integer, .min = 500, .max = 60000, .step = 250 },
-    .{ .tab = 2, .section = "system", .key = "ram", .label = "Show RAM", .kind = .boolean },
-    .{ .tab = 2, .section = "system", .key = "cpu", .label = "Show CPU", .kind = .boolean },
-    .{ .tab = 2, .section = "system", .key = "temp", .label = "Show temperature", .kind = .boolean },
-    // glow
-    .{ .tab = 2, .section = "glow", .key = "enabled", .label = "Active-app glow", .kind = .boolean, .help = "In-dock blur halo behind the active icon" },
-    .{ .tab = 2, .section = "glow", .key = "radius", .label = "Glow radius (px)", .kind = .float, .min = 0, .max = 64, .step = 1, .digits = 0 },
+    // ---- Widgets ----
+    .{ .tab = .widgets, .section = "magnify", .key = "enabled", .label_key = "magnify_enabled", .kind = .boolean },
+    .{ .tab = .widgets, .section = "magnify", .key = "spread", .label_key = "spread", .kind = .integer, .min = 1, .max = 12, .step = 1 },
+    .{ .tab = .widgets, .section = "magnify", .key = "spring", .label_key = "spring", .kind = .boolean },
+    .{ .tab = .widgets, .section = "island", .key = "enabled", .label_key = "island", .kind = .boolean },
+    .{ .tab = .widgets, .section = "progress", .key = "enabled", .label_key = "progress", .kind = .boolean },
+    .{ .tab = .widgets, .section = "badge", .key = "enabled", .label_key = "badge", .kind = .boolean },
 
-    // ---- 3 · Glass ----
-    .{ .tab = 3, .section = "glass", .key = "enabled", .label = "Liquid glass", .kind = .boolean, .help = "Real GLSL panel (adds ~70 MB RSS); off = CSS glass" },
-    .{ .tab = 3, .section = "glass", .key = "radius", .label = "Corner radius (px)", .kind = .float, .min = 0, .max = 64, .step = 1, .digits = 0 },
-    .{ .tab = 3, .section = "glass", .key = "margin", .label = "Inset (px)", .kind = .float, .min = 0, .max = 64, .step = 1, .digits = 0, .help = "Must match the #dockh-box CSS margin" },
-    .{ .tab = 3, .section = "glass", .key = "refraction", .label = "Refraction", .kind = .float, .min = 0, .max = 1, .step = 0.05, .digits = 2, .help = "Bend strength at the panel edges" },
-    .{ .tab = 3, .section = "glass", .key = "dispersion", .label = "Chromatic dispersion", .kind = .float, .min = 0, .max = 1, .step = 0.05, .digits = 2 },
-    .{ .tab = 3, .section = "glass", .key = "splay", .label = "Edge curvature", .kind = .float, .min = 0, .max = 1, .step = 0.05, .digits = 2 },
-    .{ .tab = 3, .section = "glass", .key = "frost", .label = "Frost blur", .kind = .float, .min = 0, .max = 1, .step = 0.05, .digits = 2 },
-    .{ .tab = 3, .section = "glass", .key = "depth", .label = "Depth tint", .kind = .float, .min = 0, .max = 1, .step = 0.05, .digits = 2 },
-    .{ .tab = 3, .section = "glass", .key = "light_angle", .label = "Light angle (°)", .kind = .float, .min = -180, .max = 180, .step = 5, .digits = 0 },
-    .{ .tab = 3, .section = "glass", .key = "alpha", .label = "Panel opacity", .kind = .float, .min = 0, .max = 1, .step = 0.05, .digits = 2 },
-
-    // ---- 4 · Apps ----
-    .{ .tab = 4, .section = "apps", .key = "css_file", .label = "Stylesheet file", .kind = .string, .help = "File name inside the config dir" },
-    .{ .tab = 4, .section = "apps", .key = "pinned", .label = "Pinned apps", .kind = .list, .help = "Comma-separated classes / .desktop ids" },
-    .{ .tab = 4, .section = "apps", .key = "ignore_classes", .label = "Ignored classes", .kind = .list, .help = "Comma-separated window classes to skip" },
-    .{ .tab = 4, .section = "apps", .key = "ignore_workspaces", .label = "Ignored workspaces", .kind = .list, .help = "Comma-separated, e.g. special,10" },
-
-    // ---- 5 · Memoria ----
-    .{ .tab = 5, .section = "memory", .key = "watch_sec", .label = "Watch interval (s)", .kind = .integer, .min = 0, .max = 300, .step = 1, .help = "RSS sampling; 0 = off" },
-    .{ .tab = 5, .section = "memory", .key = "trim_above_mb", .label = "Trim heap above (MB)", .kind = .integer, .min = 0, .max = 2048, .step = 8, .help = "Force malloc_trim above this RSS; 0 = off" },
-    .{ .tab = 5, .section = "memory", .key = "glass_off_mb", .label = "Drop glass above (MB)", .kind = .integer, .min = 0, .max = 2048, .step = 8, .help = "Hard ceiling: disables the GLSL shader; 0 = off" },
+    // ---- Apps ----
+    .{ .tab = .apps, .section = "apps", .key = "css_file", .label_key = "css_file", .kind = .string },
+    .{ .tab = .apps, .section = "apps", .key = "pinned", .label_key = "pinned", .kind = .list },
+    .{ .tab = .apps, .section = "apps", .key = "ignore_classes", .label_key = "ignore_classes", .kind = .list },
+    .{ .tab = .apps, .section = "apps", .key = "ignore_workspaces", .label_key = "ignore_ws", .kind = .list },
 };
 
 var field_widgets: [fields.len]?*anyopaque = .{null} ** fields.len;
 
 // ---------------------------------------------------------------------------
-// Paths (same resolution as the dock: $XDG_CONFIG_HOME/dockh, ~/.config/dockh)
+// Icon size live preview
+// ---------------------------------------------------------------------------
+
+var icon_preview_area: ?*anyopaque = null;
+
+fn iconPreviewDraw(_: ?*anyopaque, cr: c.Cairo, width: c_int, height: c_int, _: ?*anyopaque) callconv(.c) void {
+    const w: f64 = @floatFromInt(width);
+    const h: f64 = @floatFromInt(height);
+
+    // Dark background
+    c.cairo_set_source_rgba(cr, 0.08, 0.09, 0.12, 1.0);
+    c.cairo_paint(cr);
+
+    // Get current icon_size from the spin button
+    var icon_size: f64 = 48;
+    for (fields, 0..) |f, i| {
+        if (std.mem.eql(u8, f.key, "icon_size")) {
+            if (field_widgets[i]) |wi| {
+                icon_size = c.gtk_spin_button_get_value(wi);
+            }
+            break;
+        }
+    }
+
+    // Draw a dock-like panel
+    const panel_h = icon_size + 28;
+    const panel_y = h - panel_h - 8;
+    const panel_x: f64 = 12;
+    const panel_w = w - 24;
+    const radius = 14.0;
+
+    // Panel background
+    c.cairo_set_source_rgba(cr, 0.12, 0.13, 0.17, 0.90);
+    cairoRoundedRect(cr, panel_x, panel_y, panel_w, panel_h, radius);
+    c.cairo_fill(cr);
+
+    // Panel border
+    c.cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
+    c.cairo_set_line_width(cr, 1);
+    cairoRoundedRect(cr, panel_x, panel_y, panel_w, panel_h, radius);
+    c.cairo_stroke(cr);
+
+    // Draw sample icons
+    const colors = [_][3]f64{
+        .{ 0.94, 0.40, 0.30 },
+        .{ 0.30, 0.62, 0.95 },
+        .{ 0.98, 0.76, 0.28 },
+        .{ 0.36, 0.84, 0.50 },
+        .{ 0.72, 0.42, 0.96 },
+    };
+    const n: f64 = @floatFromInt(colors.len);
+    const slot = icon_size + 12;
+    const total_w = slot * n;
+    const start_x = panel_x + (panel_w - total_w) / 2.0;
+    const icon_y = panel_y + (panel_h - icon_size) / 2.0;
+
+    for (colors, 0..) |col, idx| {
+        const x = start_x + @as(f64, @floatFromInt(idx)) * slot;
+        const round = icon_size * 0.22;
+
+        // Icon body
+        c.cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.95);
+        cairoRoundedRect(cr, x, icon_y, icon_size, icon_size, round);
+        c.cairo_fill(cr);
+
+        // Top sheen
+        const sheen = c.cairo_pattern_create_linear(0, icon_y, 0, icon_y + icon_size);
+        c.cairo_pattern_add_color_stop_rgba(sheen, 0, 1, 1, 1, 0.30);
+        c.cairo_pattern_add_color_stop_rgba(sheen, 0.4, 1, 1, 1, 0.05);
+        c.cairo_pattern_add_color_stop_rgba(sheen, 1, 0, 0, 0, 0.15);
+        c.cairo_set_source(cr, sheen);
+        cairoRoundedRect(cr, x, icon_y, icon_size, icon_size, round);
+        c.cairo_fill(cr);
+        c.cairo_pattern_destroy(sheen);
+    }
+}
+
+fn cairoRoundedRect(cr: c.Cairo, x: f64, y: f64, w: f64, h: f64, r: f64) void {
+    const rr = @min(r, @min(w, h) / 2.0);
+    c.cairo_new_path(cr);
+    c.cairo_move_to(cr, x + rr, y);
+    c.cairo_line_to(cr, x + w - rr, y);
+    c.cairo_arc(cr, x + w - rr, y + rr, rr, -std.math.pi / 2.0, 0);
+    c.cairo_line_to(cr, x + w, y + h - rr);
+    c.cairo_arc(cr, x + w - rr, y + h - rr, rr, 0, std.math.pi / 2.0);
+    c.cairo_line_to(cr, x + rr, y + h);
+    c.cairo_arc(cr, x + rr, y + h - rr, rr, std.math.pi / 2.0, std.math.pi);
+    c.cairo_line_to(cr, x, y + rr);
+    c.cairo_arc(cr, x + rr, y + rr, rr, std.math.pi, std.math.pi * 1.5);
+    c.cairo_close_path(cr);
+}
+
+fn refreshIconPreview() void {
+    if (icon_preview_area) |g| c.gtk_widget_queue_draw(g);
+}
+
+// ---------------------------------------------------------------------------
+// Paths
 // ---------------------------------------------------------------------------
 
 fn envSpan(name: [*:0]const u8) ?[]const u8 {
@@ -212,7 +517,7 @@ fn eq(a: []const u8, b: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Config value access: one big switch from (section, key) -> typed value
+// Config value access
 // ---------------------------------------------------------------------------
 
 const Val = union(enum) { b: bool, i: i64, f: f64, s: []const u8, list: []const []const u8 };
@@ -253,16 +558,13 @@ fn fieldVal(cfg: *const config_mod.Config, f: Field) Val {
     } else if (eq(s, "magnify")) {
         if (eq(k, "enabled")) return .{ .b = cfg.magnify_enabled };
         if (eq(k, "spread")) return .{ .i = cfg.magnify_spread };
+        if (eq(k, "falloff")) return .{ .f = cfg.magnify_falloff };
         if (eq(k, "steps")) return .{ .i = @intCast(cfg.magnify_steps) };
         if (eq(k, "duration_ms")) return .{ .i = cfg.magnify_duration_ms };
         if (eq(k, "spring")) return .{ .b = cfg.magnify_spring };
         if (eq(k, "spring_strength")) return .{ .f = cfg.magnify_spring_strength };
-        if (eq(k, "click_spring")) return .{ .b = cfg.magnify_click_spring };
-        if (eq(k, "press_strength")) return .{ .f = cfg.magnify_press_strength };
-        if (eq(k, "release_strength")) return .{ .f = cfg.magnify_release_strength };
-        if (eq(k, "ghost_launch")) return .{ .b = cfg.magnify_ghost_launch };
-        if (eq(k, "ghost_ms")) return .{ .i = cfg.magnify_ghost_ms };
-        if (eq(k, "ghost_scale")) return .{ .f = cfg.magnify_ghost_scale };
+    } else if (eq(s, "island")) {
+        if (eq(k, "enabled")) return .{ .b = cfg.island_enabled };
     } else if (eq(s, "progress")) {
         if (eq(k, "enabled")) return .{ .b = cfg.progress_enabled };
     } else if (eq(s, "badge")) {
@@ -281,21 +583,6 @@ fn fieldVal(cfg: *const config_mod.Config, f: Field) Val {
     } else if (eq(s, "appearance")) {
         if (eq(k, "icon_shadow")) return .{ .b = cfg.icon_shadow };
         if (eq(k, "icon_shadow_radius")) return .{ .f = cfg.icon_shadow_radius };
-    } else if (eq(s, "glass")) {
-        if (eq(k, "enabled")) return .{ .b = cfg.glass_enabled };
-        if (eq(k, "radius")) return .{ .f = cfg.glass_radius };
-        if (eq(k, "margin")) return .{ .f = cfg.glass_margin };
-        if (eq(k, "refraction")) return .{ .f = cfg.glass_refraction };
-        if (eq(k, "dispersion")) return .{ .f = cfg.glass_dispersion };
-        if (eq(k, "splay")) return .{ .f = cfg.glass_splay };
-        if (eq(k, "frost")) return .{ .f = cfg.glass_frost };
-        if (eq(k, "depth")) return .{ .f = cfg.glass_depth };
-        if (eq(k, "light_angle")) return .{ .f = cfg.glass_light_angle };
-        if (eq(k, "alpha")) return .{ .f = cfg.glass_alpha };
-    } else if (eq(s, "memory")) {
-        if (eq(k, "watch_sec")) return .{ .i = cfg.memory_watch_sec };
-        if (eq(k, "trim_above_mb")) return .{ .i = cfg.memory_trim_above_mb };
-        if (eq(k, "glass_off_mb")) return .{ .i = cfg.memory_glass_off_mb };
     } else if (eq(s, "apps")) {
         if (eq(k, "css_file")) return .{ .s = cfg.css_file };
         if (eq(k, "pinned")) return .{ .list = cfg.pinned };
@@ -306,7 +593,7 @@ fn fieldVal(cfg: *const config_mod.Config, f: Field) Val {
 }
 
 // ---------------------------------------------------------------------------
-// Load: parse the file into a Config and populate every widget
+// Load / Save
 // ---------------------------------------------------------------------------
 
 fn joinList(items: []const []const u8, out: *std.ArrayList(u8)) void {
@@ -325,13 +612,10 @@ fn setWidgetFromVal(f: Field, w: ?*anyopaque, v: Val) void {
             const z = alloc.dupeZ(u8, v.s) catch return;
             c.gtk_editable_set_text(w, z.ptr);
         },
-        .en => {
+        .en_opt => {
             var idx: c_uint = 0;
             for (f.options, 0..) |o, i| {
-                if (eq(o, v.s)) {
-                    idx = @intCast(i);
-                    break;
-                }
+                if (eq(o, v.s)) { idx = @intCast(i); break; }
             }
             c.gtk_drop_down_set_selected(w, idx);
         },
@@ -345,7 +629,6 @@ fn setWidgetFromVal(f: Field, w: ?*anyopaque, v: Val) void {
     }
 }
 
-/// Read the pinned cache file (the dock's runtime truth) into a list.
 fn readPinnedCache() ?[]const []const u8 {
     const path = pinnedCachePath();
     if (!fs.pathExists(path)) return null;
@@ -371,25 +654,13 @@ fn loadValues() void {
     for (fields, 0..) |f, i| {
         const w = field_widgets[i] orelse continue;
         var v = fieldVal(&cfg, f);
-        // Pinned apps come from the cache file when it exists (it wins).
         if (eq(f.section, "apps") and eq(f.key, "pinned")) {
             if (readPinnedCache()) |list| v = .{ .list = list };
         }
         setWidgetFromVal(f, w, v);
     }
-    // Reset the preset dropdown to an unset state (the notify::selected that
-    // fires while loading_values is true is a no-op in the handler).
-    if (glass_preset_drop) |d| {
-        // GTK_INVALID_LIST_POSITION == G_MAXUINT — GTK4's "no selection".
-        c.gtk_drop_down_set_selected(d, std.math.maxInt(c_uint));
-    }
-    // First paint of the preview with the freshly loaded values.
-    refreshGlassPreview();
+    refreshIconPreview();
 }
-
-// ---------------------------------------------------------------------------
-// Save: read every widget, rewrite the file textually, poke the pinned cache
-// ---------------------------------------------------------------------------
 
 fn widgetNewValue(f: Field, w: ?*anyopaque) ?[]const u8 {
     switch (f.kind) {
@@ -409,7 +680,7 @@ fn widgetNewValue(f: Field, w: ?*anyopaque) ?[]const u8 {
             const t = c.gtk_editable_get_text(w) orelse return config_mod.quoteStr(alloc, "") catch null;
             return config_mod.quoteStr(alloc, std.mem.span(t)) catch null;
         },
-        .en => {
+        .en_opt => {
             const idx = c.gtk_drop_down_get_selected(w);
             const opt = f.options[@min(idx, f.options.len - 1)];
             return config_mod.quoteStr(alloc, opt) catch null;
@@ -429,7 +700,6 @@ fn widgetNewValue(f: Field, w: ?*anyopaque) ?[]const u8 {
     }
 }
 
-/// Parse a comma/space list back into items (for the pinned cache file).
 fn widgetListItems(w: ?*anyopaque, out: *std.ArrayList([]const u8)) void {
     const t = c.gtk_editable_get_text(w) orelse return;
     var it = std.mem.tokenizeAny(u8, std.mem.span(t), " \t,\n\r");
@@ -453,14 +723,13 @@ fn saveConfig() void {
         const w = field_widgets[i] orelse continue;
         const new_value = widgetNewValue(f, w) orelse continue;
         const updated = config_mod.setValueInText(alloc, text, f.section, f.key, new_value) catch {
-            setStatus("Save failed (out of memory)");
+            setStatus("Error de memoria");
             return;
         };
         if (updated.ptr != text.ptr) {
             alloc.free(text);
             text = updated;
         }
-        // Keep the pinned cache file in sync (the dock's runtime truth).
         if (eq(f.section, "apps") and eq(f.key, "pinned")) {
             var items: std.ArrayList([]const u8) = .empty;
             widgetListItems(w, &items);
@@ -469,7 +738,7 @@ fn saveConfig() void {
     }
 
     fs.writeFile(config_path, text) catch {
-        setStatus("Save failed — cannot write the config file");
+        setStatus("Error al escribir config");
         return;
     };
 
@@ -485,7 +754,7 @@ fn saveConfig() void {
         fs.writeFile(pinnedCachePath(), buf.items) catch {};
     }
 
-    setStatus("Saved — the dock applies it now (config hot reload)");
+    setStatus(i18n().lbl_saved);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +780,7 @@ fn makeControl(f: Field) ?*anyopaque {
             return spin;
         },
         .string, .list => return c.gtk_entry_new(),
-        .en => {
+        .en_opt => {
             var list: std.ArrayList(?[*:0]const u8) = .empty;
             defer list.deinit(alloc);
             for (f.options) |o| {
@@ -520,483 +789,216 @@ fn makeControl(f: Field) ?*anyopaque {
             }
             list.append(alloc, null) catch {};
             const drop = c.gtk_drop_down_new_from_strings(@ptrCast(list.items.ptr));
+            styleDropdown(drop);
             return drop;
         },
     }
 }
 
+fn styleDropdown(drop: ?*anyopaque) void {
+    const popover_type = c.gtk_popover_get_type();
+    var child = c.gtk_widget_get_first_child(drop);
+    while (child != null) {
+        const inst: *const c.GTypeInstance = @ptrCast(@alignCast(child.?));
+        const obj_type = if (inst.g_class) |cls| cls.g_type else 0;
+        if (c.g_type_is_a(obj_type, popover_type) != 0) {
+            c.gtk_widget_add_css_class(child, "dockh-config-window");
+            return;
+        }
+        child = c.gtk_widget_get_next_sibling(child);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Glass tab: presets + live preview (approximates the GLSL shader with Cairo)
+// Live update: when the icon_size spin changes, redraw the preview
 // ---------------------------------------------------------------------------
 
-/// Widget for a glass key (spin / switch) — or null if the tab isn't built.
-fn glassWidgetFor(key: []const u8) ?*anyopaque {
-    for (fields, 0..) |f, i| {
-        if (f.tab == 3 and eq(f.section, "glass") and eq(f.key, key)) {
-            return field_widgets[i];
+fn onIconSizeChanged(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    refreshIconPreview();
+}
+
+fn onIconSizeSpinChanged(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    refreshIconPreview();
+}
+
+// ---------------------------------------------------------------------------
+// Language toggle
+// ---------------------------------------------------------------------------
+
+var lang_toggle_btn: ?*anyopaque = null;
+var tab_notebook: ?*anyopaque = null;
+var rebuild_pending = false;
+
+fn rebuildUI() void {
+    if (tab_notebook == null or win == null) return;
+    // Destroy old notebook child
+    if (tab_notebook) |nb| {
+        var old_child = c.gtk_widget_get_first_child(nb);
+        while (old_child != null) {
+            const next = c.gtk_widget_get_next_sibling(old_child);
+            c.gtk_widget_unparent(old_child);
+            old_child = next;
         }
     }
-    return null;
-}
-
-fn readGlassEnabled() bool {
-    const w = glassWidgetFor("enabled") orelse return false;
-    return c.gtk_switch_get_active(w) != 0;
-}
-
-fn readGlassFloat(key: []const u8) f64 {
-    const w = glassWidgetFor(key) orelse return 0;
-    return c.gtk_spin_button_get_value(w);
-}
-
-/// Rounded-rect path (cairo has no rounded_rectangle in this version).
-fn cairoRoundedRect(cr: c.Cairo, x: f64, y: f64, w: f64, h: f64, r: f64) void {
-    const rr = @min(r, @min(w, h) / 2.0);
-    c.cairo_new_path(cr);
-    c.cairo_move_to(cr, x + rr, y);
-    c.cairo_line_to(cr, x + w - rr, y);
-    c.cairo_arc(cr, x + w - rr, y + rr, rr, -std.math.pi / 2.0, 0);
-    c.cairo_line_to(cr, x + w, y + h - rr);
-    c.cairo_arc(cr, x + w - rr, y + h - rr, rr, 0, std.math.pi / 2.0);
-    c.cairo_line_to(cr, x + rr, y + h);
-    c.cairo_arc(cr, x + rr, y + h - rr, rr, std.math.pi / 2.0, std.math.pi);
-    c.cairo_line_to(cr, x, y + rr);
-    c.cairo_arc(cr, x + rr, y + rr, rr, std.math.pi, std.math.pi * 1.5);
-    c.cairo_close_path(cr);
-}
-
-/// Fake desktop behind the panel so refraction/frost have something to show:
-/// a dusk gradient with a radial sun glow, mountain silhouettes and two
-/// "app windows" — vivid shapes that visibly bend when refraction zooms.
-fn drawPreviewBackdrop(cr: c.Cairo, w: f64, h: f64) void {
-    // Dusk sky gradient.
-    const pat = c.cairo_pattern_create_linear(0, 0, 0, h);
-    c.cairo_pattern_add_color_stop_rgba(pat, 0, 0.24, 0.30, 0.52, 1);
-    c.cairo_pattern_add_color_stop_rgba(pat, 0.55, 0.10, 0.13, 0.26, 1);
-    c.cairo_pattern_add_color_stop_rgba(pat, 1, 0.04, 0.05, 0.10, 1);
-    c.cairo_set_source(cr, pat);
-    c.cairo_paint(cr);
-    c.cairo_pattern_destroy(pat);
-
-    // Sun glow (radial) behind the mountains.
-    const gx = w * 0.30;
-    const gy = h * 0.42;
-    const glow = c.cairo_pattern_create_radial(gx, gy, 2, gx, gy, w * 0.30);
-    c.cairo_pattern_add_color_stop_rgba(glow, 0, 1.0, 0.75, 0.35, 0.9);
-    c.cairo_pattern_add_color_stop_rgba(glow, 0.4, 0.95, 0.55, 0.22, 0.35);
-    c.cairo_pattern_add_color_stop_rgba(glow, 1, 0.4, 0.2, 0.05, 0);
-    c.cairo_set_source(cr, glow);
-    c.cairo_paint(cr);
-    c.cairo_pattern_destroy(glow);
-
-    // Mountain silhouettes.
-    c.cairo_set_source_rgba(cr, 0.03, 0.04, 0.08, 0.95);
-    c.cairo_new_path(cr);
-    c.cairo_move_to(cr, 0, h);
-    c.cairo_line_to(cr, w * 0.12, h * 0.62);
-    c.cairo_line_to(cr, w * 0.28, h * 0.80);
-    c.cairo_line_to(cr, w * 0.45, h * 0.58);
-    c.cairo_line_to(cr, w * 0.62, h * 0.76);
-    c.cairo_line_to(cr, w * 0.82, h * 0.60);
-    c.cairo_line_to(cr, w, h * 0.72);
-    c.cairo_line_to(cr, w, h);
-    c.cairo_close_path(cr);
-    c.cairo_fill(cr);
-
-    // Two colored "app windows" floating above the mountains.
-    c.cairo_set_source_rgba(cr, 0.95, 0.60, 0.30, 0.95);
-    cairoRoundedRect(cr, w * 0.10, h * 0.20, w * 0.15, h * 0.28, 4);
-    c.cairo_fill(cr);
-    c.cairo_set_source_rgba(cr, 0.34, 0.66, 0.90, 0.95);
-    cairoRoundedRect(cr, w * 0.52, h * 0.16, w * 0.21, h * 0.34, 4);
-    c.cairo_fill(cr);
-    c.cairo_set_source_rgba(cr, 0.42, 0.85, 0.55, 0.90);
-    c.cairo_arc(cr, w * 0.80, h * 0.58, h * 0.16, 0, 2 * std.math.pi);
-    c.cairo_fill(cr);
-}
-
-/// A row of rounded "app icons" sitting on the panel bottom — so the preview
-/// reads as a real dock at a glance. Five macOS-ish colors.
-fn drawDockIcons(cr: c.Cairo, px: f64, py: f64, pw: f64, ph: f64) void {
-    const colors = [_][3]f64{
-        .{ 0.94, 0.40, 0.30 }, // red-orange
-        .{ 0.30, 0.62, 0.95 }, // blue
-        .{ 0.98, 0.76, 0.28 }, // yellow
-        .{ 0.36, 0.84, 0.50 }, // green
-        .{ 0.72, 0.42, 0.96 }, // purple
-    };
-    const n: f64 = @floatFromInt(colors.len);
-    const slot = pw / (n + 2.0); // icon spacing (1 free slot each side)
-    const isz = @min(slot * 0.62, ph * 0.30);
-    const y = py + ph - isz - 6.0;
-    var x = px + slot;
-    for (colors) |col| {
-        // Icon body with a subtle top sheen (glass look).
-        c.cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.95);
-        cairoRoundedRect(cr, x, y, isz, isz, isz * 0.24);
-        c.cairo_fill(cr);
-        const sheen = c.cairo_pattern_create_linear(0, y, 0, y + isz);
-        c.cairo_pattern_add_color_stop_rgba(sheen, 0, 1, 1, 1, 0.35);
-        c.cairo_pattern_add_color_stop_rgba(sheen, 0.45, 1, 1, 1, 0.06);
-        c.cairo_pattern_add_color_stop_rgba(sheen, 1, 0, 0, 0, 0.18);
-        c.cairo_set_source(cr, sheen);
-        cairoRoundedRect(cr, x, y, isz, isz, isz * 0.24);
-        c.cairo_fill(cr);
-        c.cairo_pattern_destroy(sheen);
-        x += slot;
-    }
-}
-
-/// The dock glass panel the shader draws, approximated for the preview.
-/// Every knob maps to a visible effect: refraction zooms the backdrop,
-/// dispersion fringes the edges RGB, splay rounds/brightens the bevel,
-/// frost washes it white, depth darkens the bottom, light_angle orients the
-/// specular highlight, alpha sets the panel fill, radius/margin shape it.
-fn glassPreviewDraw(_: ?*anyopaque, cr: c.Cairo, width: c_int, height: c_int, _: ?*anyopaque) callconv(.c) void {
-    const w: f64 = @floatFromInt(width);
-    const h: f64 = @floatFromInt(height);
-    drawPreviewBackdrop(cr, w, h);
-
-    const enabled = readGlassEnabled();
-    const radius = readGlassFloat("radius");
-    const margin = @max(readGlassFloat("margin"), 2);
-    const refraction = readGlassFloat("refraction");
-    const dispersion = readGlassFloat("dispersion");
-    const splay = readGlassFloat("splay");
-    const frost = readGlassFloat("frost");
-    const depth = readGlassFloat("depth");
-    const angle_deg = readGlassFloat("light_angle");
-    const alpha = readGlassFloat("alpha");
-
-    // Panel rect (scaled up so margin reads visibly in a small preview).
-    const px = margin * 1.6;
-    const py = margin * 1.6;
-    const pw = w - 2 * px;
-    const ph = h - 2 * py;
-    if (pw <= 4 or ph <= 4) return;
-
-    // Soft drop shadow under the floating panel (two blurs for depth).
-    c.cairo_save(cr);
-    cairoRoundedRect(cr, px + 3, py + 5, pw, ph, radius);
-    c.cairo_set_source_rgba(cr, 0, 0, 0, 0.30);
-    c.cairo_fill(cr);
-    cairoRoundedRect(cr, px + 1, py + 2, pw, ph, radius);
-    c.cairo_set_source_rgba(cr, 0, 0, 0, 0.18);
-    c.cairo_fill(cr);
-    c.cairo_restore(cr);
-
-    if (!enabled) {
-        // CSS-glass fallback: flat dark translucent panel + icons.
-        cairoRoundedRect(cr, px, py, pw, ph, radius);
-        c.cairo_set_source_rgba(cr, 0.07, 0.08, 0.12, 0.78);
-        c.cairo_fill(cr);
-        drawDockIcons(cr, px, py, pw, ph);
-        cairoRoundedRect(cr, px, py, pw, ph, radius);
-        c.cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
-        c.cairo_set_line_width(cr, 1);
-        c.cairo_stroke(cr);
-        return;
-    }
-
-    // 1) Refraction: re-draw the backdrop zoomed inside the panel clip.
-    c.cairo_save(cr);
-    cairoRoundedRect(cr, px, py, pw, ph, radius);
-    c.cairo_clip(cr);
-    const zoom = 1.0 + refraction * 0.25;
-    const cx = w / 2;
-    const cy = h / 2;
-    c.cairo_translate(cr, cx, cy);
-    c.cairo_scale(cr, zoom, zoom);
-    c.cairo_translate(cr, -cx, -cy);
-    drawPreviewBackdrop(cr, w, h);
-
-    // 2) Frost: white wash (the shader's gaussian blur feels like this).
-    if (frost > 0) {
-        c.cairo_set_source_rgba(cr, 1, 1, 1, frost * 0.45);
-        c.cairo_paint(cr);
-    }
-
-    // 3) Depth: darkening toward the bottom edge.
-    if (depth > 0) {
-        const dpat = c.cairo_pattern_create_linear(0, py, 0, py + ph);
-        c.cairo_pattern_add_color_stop_rgba(dpat, 0, 0, 0, 0, 0);
-        c.cairo_pattern_add_color_stop_rgba(dpat, 1, 0, 0, 0, depth * 0.65);
-        c.cairo_set_source(cr, dpat);
-        c.cairo_paint(cr);
-        c.cairo_pattern_destroy(dpat);
-    }
-
-    // 4) Panel tint: the glass body with the user's alpha.
-    c.cairo_set_source_rgba(cr, 0.09, 0.12, 0.19, alpha);
-    c.cairo_paint(cr);
-    c.cairo_restore(cr);
-
-    // 5) Specular bevel lit from light_angle (a soft band near that edge).
-    if (splay > 0.01) {
-        const rad = angle_deg * std.math.pi / 180.0;
-        const dx = @cos(rad);
-        const dy = @sin(rad);
-        c.cairo_save(cr);
-        cairoRoundedRect(cr, px, py, pw, ph, radius);
-        c.cairo_clip(cr);
-        const sx = cx + dx * pw * 0.5;
-        const sy = cy + dy * ph * 0.5;
-        const ex = cx - dx * pw * 0.5;
-        const ey = cy - dy * ph * 0.5;
-        const spat = c.cairo_pattern_create_linear(sx, sy, ex, ey);
-        c.cairo_pattern_add_color_stop_rgba(spat, 0, 1, 1, 1, splay * 0.50);
-        c.cairo_pattern_add_color_stop_rgba(spat, 0.55, 1, 1, 1, splay * 0.08);
-        c.cairo_pattern_add_color_stop_rgba(spat, 1, 1, 1, 1, 0);
-        c.cairo_set_source(cr, spat);
-        c.cairo_paint(cr);
-        c.cairo_pattern_destroy(spat);
-        // Rim light: a bright hairline along the light-facing edge.
-        c.cairo_set_source_rgba(cr, 1, 1, 1, 0.35 + splay * 0.25);
-        c.cairo_set_line_width(cr, 1.2);
-        c.cairo_move_to(cr, px + radius, py + 1);
-        c.cairo_line_to(cr, px + pw - radius, py + 1);
-        c.cairo_stroke(cr);
-        c.cairo_restore(cr);
-    }
-
-    // 6) Chromatic dispersion: thin R/C fringes on the top/bottom edges.
-    if (dispersion > 0.01) {
-        c.cairo_save(cr);
-        cairoRoundedRect(cr, px, py, pw, ph, radius);
-        c.cairo_set_line_width(cr, 2.5);
-        c.cairo_set_source_rgba(cr, 1, 0.25, 0.25, dispersion * 0.7);
-        c.cairo_stroke_preserve(cr);
-        c.cairo_set_source_rgba(cr, 0.25, 0.6, 1, dispersion * 0.7);
-        c.cairo_set_line_width(cr, 1);
-        c.cairo_stroke(cr);
-        c.cairo_restore(cr);
-    }
-
-    // 7) Dock icons on the glass.
-    drawDockIcons(cr, px, py, pw, ph);
-
-    // 8) Crisp edge.
-    cairoRoundedRect(cr, px, py, pw, ph, radius);
-    c.cairo_set_source_rgba(cr, 1, 1, 1, 0.16 + splay * 0.10);
-    c.cairo_set_line_width(cr, 1);
-    c.cairo_stroke(cr);
-}
-
-fn refreshGlassPreview() void {
-    if (glass_preview) |g| c.gtk_widget_queue_draw(g);
-}
-
-fn applyGlassPreset(idx: usize) void {
-    if (idx >= glass_presets.len) return;
-    const p = glass_presets[idx];
-    setSpin("radius", p.radius);
-    setSpin("margin", p.margin);
-    setSpin("refraction", p.refraction);
-    setSpin("dispersion", p.dispersion);
-    setSpin("splay", p.splay);
-    setSpin("frost", p.frost);
-    setSpin("depth", p.depth);
-    setSpin("light_angle", p.light_angle);
-    setSpin("alpha", p.alpha);
-    refreshGlassPreview();
-    setStatus("Preset applied — click Save to write it");
-}
-
-fn setSpin(key: []const u8, v: f64) void {
-    if (glassWidgetFor(key)) |w| c.gtk_spin_button_set_value(w, v);
-}
-
-fn onGlassControlChanged(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    refreshGlassPreview();
-}
-
-fn onGlassSwitchChanged(_: ?*anyopaque, _: c_int, _: ?*anyopaque) callconv(.c) c_int {
-    refreshGlassPreview();
-    return 0; // FALSE — let GTK apply the new state itself
-}
-
-fn onGlassPresetSelected(_: ?*anyopaque, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    if (loading_values) return; // loadValues() reset the dropdown
-    const idx = c.gtk_drop_down_get_selected(glass_preset_drop);
-    applyGlassPreset(idx);
-}
-
-fn buildTab(notebook: ?*anyopaque, tab_idx: u8) void {
-    const scrolled = c.gtk_scrolled_window_new();
-    c.gtk_scrolled_window_set_policy(scrolled, c.POLICY_AUTOMATIC, c.POLICY_AUTOMATIC);
-    const grid = c.gtk_grid_new();
-    c.gtk_grid_set_row_spacing(grid, 8);
-    c.gtk_grid_set_column_spacing(grid, 14);
-    c.gtk_widget_set_margin_start(grid, 20);
-    c.gtk_widget_set_margin_end(grid, 20);
-    c.gtk_widget_set_margin_top(grid, 14);
-    c.gtk_widget_set_margin_bottom(grid, 14);
-    c.gtk_scrolled_window_set_child(scrolled, grid);
-
-    var row: c_int = 0;
-    var last_section: []const u8 = "";
-
-    // Glass tab: live preview + preset dropdown sit above the knobs.
-    if (tab_idx == 3) {
-        // --- Preset row ---
-        const preset_lbl = c.gtk_label_new("Preset");
-        c.gtk_widget_set_halign(preset_lbl, c.ALIGN_START);
-        c.gtk_widget_set_tooltip_text(preset_lbl, "One click: Light / Frost / Spray / Liquid / Deep");
-        var popts: std.ArrayList(?[*:0]const u8) = .empty;
-        defer popts.deinit(alloc);
-        for (glass_presets) |p| {
-            const z = alloc.dupeZ(u8, p.name) catch continue;
-            popts.append(alloc, z) catch continue;
-        }
-        popts.append(alloc, null) catch {};
-        glass_preset_drop = c.gtk_drop_down_new_from_strings(@ptrCast(popts.items.ptr));
-        _ = c.g_signal_connect(glass_preset_drop, "notify::selected", @ptrCast(&onGlassPresetSelected), null);
-        c.gtk_widget_set_hexpand(glass_preset_drop, 1);
-        c.gtk_grid_attach(grid, preset_lbl, 0, row, 1, 1);
-        c.gtk_grid_attach(grid, glass_preset_drop, 1, row, 1, 1);
-        row += 1;
-
-        // --- Live preview ---
-        glass_preview = c.gtk_drawing_area_new();
-        c.gtk_drawing_area_set_content_width(glass_preview, 540);
-        c.gtk_drawing_area_set_content_height(glass_preview, 150);
-        c.gtk_drawing_area_set_draw_func(glass_preview, @ptrCast(&glassPreviewDraw), null, null);
-        c.gtk_widget_set_hexpand(glass_preview, 1);
-        c.gtk_widget_set_vexpand(glass_preview, 1);
-        c.gtk_widget_set_halign(glass_preview, c.ALIGN_FILL);
-        c.gtk_widget_set_valign(glass_preview, c.ALIGN_FILL);
-        const cap = c.gtk_label_new("Live preview — drag any knob below to see the glass change");
-        c.gtk_widget_add_css_class(cap, "dockh-cfg-caption");
-        c.gtk_widget_set_halign(cap, c.ALIGN_START);
-        c.gtk_grid_attach(grid, cap, 0, row, 2, 1);
-        row += 1;
-        c.gtk_grid_attach(grid, glass_preview, 0, row, 2, 1);
-        row += 1;
-    }
-
-    for (fields, 0..) |f, i| {
-        if (f.tab != tab_idx) continue;
-        if (!eq(f.section, last_section)) {
-            // Section header spanning both columns.
-            const head = c.gtk_label_new(alloc.dupeZ(u8, f.section) catch "");
-            c.gtk_widget_add_css_class(head, "dockh-cfg-section");
-            c.gtk_widget_set_halign(head, c.ALIGN_START);
-            c.gtk_grid_attach(grid, head, 0, row, 2, 1);
-            row += 1;
-            last_section = f.section;
-        }
-        const lbl = c.gtk_label_new(alloc.dupeZ(u8, f.label) catch "");
-        c.gtk_widget_set_halign(lbl, c.ALIGN_START);
-        c.gtk_widget_set_hexpand(lbl, 1);
-        if (f.help.len > 0) {
-            c.gtk_widget_set_tooltip_text(lbl, alloc.dupeZ(u8, f.help) catch "");
-        }
-        const ctl = makeControl(f) orelse continue;
-        if (f.help.len > 0) {
-            c.gtk_widget_set_tooltip_text(ctl, alloc.dupeZ(u8, f.help) catch "");
-        }
-        field_widgets[i] = ctl;
-        // Glass knobs redraw the preview live.
-        if (tab_idx == 3) {
-            if (f.kind == .boolean) {
-                _ = c.g_signal_connect(ctl, "state-set", @ptrCast(&onGlassSwitchChanged), null);
-            } else if (f.kind == .integer or f.kind == .float) {
-                _ = c.g_signal_connect(ctl, "value-changed", @ptrCast(&onGlassControlChanged), null);
-            }
-        }
-        c.gtk_widget_set_hexpand(ctl, 1);
-        c.gtk_grid_attach(grid, lbl, 0, row, 1, 1);
-        c.gtk_grid_attach(grid, ctl, 1, row, 1, 1);
-        row += 1;
-    }
-
-    const tab_label = c.gtk_label_new(alloc.dupeZ(u8, tab_names[tab_idx]) catch "");
-    _ = c.gtk_notebook_append_page(notebook, scrolled, tab_label);
-}
-
-fn onSave(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    saveConfig();
-}
-
-fn onReload(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    // Reset field widgets
+    for (&field_widgets) |*fw| fw.* = null;
+    // Rebuild tabs
+    buildTabs(tab_notebook);
     loadValues();
-    setStatus("Reloaded from disk (unsaved changes discarded)");
 }
 
-fn onDestroy(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    if (main_loop) |ml| c.g_main_loop_quit(ml);
+fn onLangToggle(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    current_lang = if (current_lang == .en) .es else .en;
+    if (lang_toggle_btn) |b| {
+        const z = alloc.dupeZ(u8, i18n().lbl_lang_toggle) catch return;
+        c.gtk_button_set_label(b, z.ptr);
+    }
+    rebuildUI();
+}
+
+// ---------------------------------------------------------------------------
+// Tab builder
+// ---------------------------------------------------------------------------
+
+fn buildTabs(notebook: ?*anyopaque) void {
+    const tabs = [_]TabKey{ .general, .behavior, .widgets, .apps };
+    const tab_labels = [_][]const u8{ i18n().tab_general, i18n().tab_behavior, i18n().tab_widgets, i18n().tab_apps };
+
+    for (tabs, 0..) |tab_key, idx| {
+        const scrolled = c.gtk_scrolled_window_new();
+        c.gtk_scrolled_window_set_policy(scrolled, c.POLICY_AUTOMATIC, c.POLICY_AUTOMATIC);
+        const grid = c.gtk_grid_new();
+        c.gtk_grid_set_row_spacing(grid, 8);
+        c.gtk_grid_set_column_spacing(grid, 14);
+        c.gtk_widget_set_margin_start(grid, 20);
+        c.gtk_widget_set_margin_end(grid, 20);
+        c.gtk_widget_set_margin_top(grid, 14);
+        c.gtk_widget_set_margin_bottom(grid, 14);
+        c.gtk_scrolled_window_set_child(scrolled, grid);
+
+        // Add icon preview on the General tab (after first section)
+        if (tab_key == .general) {
+            icon_preview_area = c.gtk_drawing_area_new();
+            c.gtk_drawing_area_set_content_width(icon_preview_area, 460);
+            c.gtk_drawing_area_set_content_height(icon_preview_area, 100);
+            c.gtk_drawing_area_set_draw_func(icon_preview_area, @ptrCast(&iconPreviewDraw), null, null);
+            c.gtk_widget_set_hexpand(icon_preview_area, 1);
+            c.gtk_widget_set_vexpand(icon_preview_area, 0);
+            const preview_lbl = c.gtk_label_new(alloc.dupeZ(u8, i18n().lbl_icon_preview) catch "Preview");
+            c.gtk_widget_add_css_class(preview_lbl, "dockh-cfg-caption");
+            c.gtk_widget_set_halign(preview_lbl, c.ALIGN_START);
+            // Insert after the first section header
+            // We'll add it at the top before the fields
+            c.gtk_grid_attach(grid, preview_lbl, 0, 0, 2, 1);
+            c.gtk_grid_attach(grid, icon_preview_area, 0, 1, 2, 1);
+        }
+
+        var row: c_int = if (tab_key == .general) @intCast(2) else 0;
+        var last_section: []const u8 = "";
+
+        for (fields, 0..) |f, i| {
+            if (f.tab != tab_key) continue;
+            if (!eq(f.section, last_section)) {
+                const head = c.gtk_label_new(alloc.dupeZ(u8, getSection(f.section)) catch "");
+                c.gtk_widget_add_css_class(head, "dockh-cfg-section");
+                c.gtk_widget_set_halign(head, c.ALIGN_START);
+                c.gtk_grid_attach(grid, head, 0, row, 2, 1);
+                row += 1;
+                last_section = f.section;
+            }
+            const lbl = c.gtk_label_new(alloc.dupeZ(u8, getLabel(f.label_key)) catch "");
+            c.gtk_widget_set_halign(lbl, c.ALIGN_START);
+            c.gtk_widget_set_hexpand(lbl, 1);
+            const ctl = makeControl(f) orelse continue;
+            field_widgets[i] = ctl;
+
+            // Live update icon preview when icon_size changes
+            if (eq(f.key, "icon_size")) {
+                _ = c.g_signal_connect(ctl, "value-changed", @ptrCast(&onIconSizeChanged), null);
+            }
+
+            c.gtk_grid_attach(grid, lbl, 0, row, 1, 1);
+            c.gtk_grid_attach(grid, ctl, 1, row, 1, 1);
+            row += 1;
+        }
+
+        const label_z = alloc.dupeZ(u8, tab_labels[idx]) catch "";
+        _ = c.gtk_notebook_append_page(notebook, scrolled, c.gtk_label_new(label_z));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build the main window
+// ---------------------------------------------------------------------------
+
+fn onSaveClicked(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    saveConfig();
 }
 
 fn buildWindow() void {
     const w = c.gtk_window_new();
     win = w;
     c.gtk_widget_set_name(w, "dockh-config-window");
-    c.gtk_window_set_title(w, "dockh — Configuration");
-    c.gtk_window_set_default_size(w, 820, 660);
+    c.gtk_widget_add_css_class(w, "dockh-config-window");
+    c.gtk_window_set_title(w, "dockh — Configuración");
+    c.gtk_window_set_default_size(w, 780, 620);
     c.gtk_window_set_resizable(w, 1);
 
-    // Header bar with Save / Reload. GTK4 has no header-bar title/subtitle
-    // properties — the title area is a widget, so stack title + path in a box.
-    const bar = c.gtk_header_bar_new();
+    // Header bar with title + save + language toggle
+    const header = c.gtk_header_bar_new();
+    c.gtk_widget_add_css_class(header, "dockh-config-window");
+
     const title_box = c.gtk_box_new(c.ORIENTATION_VERTICAL, 0);
-    const title_lbl = c.gtk_label_new("dockh — Configuration");
+    const title_lbl = c.gtk_label_new("dockh");
     c.gtk_widget_add_css_class(title_lbl, "dockh-cfg-title");
-    const path_lbl = c.gtk_label_new(alloc.dupeZ(u8, config_path) catch "");
-    c.gtk_widget_add_css_class(path_lbl, "dockh-cfg-path");
     c.gtk_box_append(title_box, title_lbl);
-    c.gtk_box_append(title_box, path_lbl);
-    c.gtk_header_bar_set_title_widget(bar, title_box);
-    const save_b = c.gtk_button_new_with_label("Save");
-    c.gtk_widget_add_css_class(save_b, "suggested-action");
-    _ = c.g_signal_connect(save_b, "clicked", @ptrCast(&onSave), null);
-    c.gtk_header_bar_pack_end(bar, save_b);
-    const reload_b = c.gtk_button_new_with_label("Reload");
-    _ = c.g_signal_connect(reload_b, "clicked", @ptrCast(&onReload), null);
-    c.gtk_header_bar_pack_end(bar, reload_b);
-    c.gtk_window_set_titlebar(w, bar);
+    c.gtk_header_bar_set_title_widget(header, title_box);
 
-    const notebook = c.gtk_notebook_new();
-    c.gtk_notebook_set_tab_pos(notebook, c.POSITION_TOP);
-    c.gtk_notebook_set_scrollable(notebook, 1);
+    // Language toggle button
+    lang_toggle_btn = c.gtk_button_new_with_label(alloc.dupeZ(u8, i18n().lbl_lang_toggle) catch "ES");
+    _ = c.g_signal_connect(lang_toggle_btn, "clicked", @ptrCast(&onLangToggle), null);
+    c.gtk_header_bar_pack_end(header, lang_toggle_btn);
 
-    var t: u8 = 0;
-    while (t < tab_names.len) : (t += 1) {
-        buildTab(notebook, t);
-    }
+    // Save button (suggested-action = accent)
+    const save_btn = c.gtk_button_new_with_label(alloc.dupeZ(u8, i18n().lbl_save) catch "Save");
+    c.gtk_widget_add_css_class(save_btn, "suggested-action");
+    _ = c.g_signal_connect(save_btn, "clicked", @ptrCast(&onSaveClicked), null);
+    c.gtk_header_bar_pack_start(header, save_btn);
 
-    const vbox = c.gtk_box_new(c.ORIENTATION_VERTICAL, 0);
-    c.gtk_box_append(vbox, notebook);
+    c.gtk_window_set_titlebar(w, header);
+
+    // Notebook (tabs)
+    tab_notebook = c.gtk_notebook_new();
+    buildTabs(tab_notebook);
+
+    // Status bar
     status_label = c.gtk_label_new("");
     c.gtk_widget_add_css_class(status_label, "dockh-cfg-status");
     c.gtk_widget_set_halign(status_label, c.ALIGN_START);
-    c.gtk_widget_set_margin_start(status_label, 20);
-    c.gtk_widget_set_margin_end(status_label, 20);
-    c.gtk_widget_set_margin_top(status_label, 8);
-    c.gtk_widget_set_margin_bottom(status_label, 10);
+    c.gtk_widget_set_margin_start(status_label, 12);
+    c.gtk_widget_set_margin_bottom(status_label, 6);
+
+    const vbox = c.gtk_box_new(c.ORIENTATION_VERTICAL, 0);
+    c.gtk_box_append(vbox, tab_notebook);
     c.gtk_box_append(vbox, status_label);
+
     c.gtk_window_set_child(w, vbox);
 
-    _ = c.g_signal_connect(w, "destroy", @ptrCast(&onDestroy), null);
+    _ = c.g_signal_connect(w, "destroy", @ptrCast(&onWindowDestroy), null);
+
+    loadValues();
+}
+
+fn onWindowDestroy(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    if (main_loop) |ml| c.g_main_loop_quit(ml);
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn printUsage() void {
-    std.debug.print(
-        \\dockh-config — graphical editor for dockh's config.toml
-        \\
-        \\Usage: dockh-config [options]
-        \\  -cfg <path>   config file to edit (default $XDG_CONFIG_HOME/dockh/config.toml)
-        \\  -h            this help
-        \\
-    , .{});
-}
-
 pub fn main(init: std.process.Init.Minimal) void {
     perm_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer perm_arena.deinit();
     alloc = perm_arena.allocator();
 
     const args = init.args.toSlice(alloc) catch &.{};
@@ -1007,21 +1009,16 @@ pub fn main(init: std.process.Init.Minimal) void {
                 cfg_override = alloc.dupe(u8, args[i + 1]) catch "";
             }
             i += 1;
-        } else if (eq(args[i], "-h") or eq(args[i], "--help")) {
-            printUsage();
-            std.process.exit(0);
         }
     }
-
     config_path = cfgPath();
     _ = fs.ensureDir(configDir());
     if (!fs.pathExists(config_path)) {
         fs.writeFile(config_path, default_toml) catch {};
     }
 
+    // GTK init + CSS
     c.gtk_init();
-
-    // A touch of styling so the form reads nicely (scoped to this window).
     const css = @embedFile("style.css");
     const provider = c.gtk_css_provider_new();
     const css_z = alloc.dupeZ(u8, css) catch "";
@@ -1033,7 +1030,6 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     buildWindow();
     loadValues();
-    setStatus("Ready — Save writes the config and the dock reloads it live");
 
     if (win) |w| c.gtk_widget_show(w);
 

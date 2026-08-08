@@ -10,7 +10,7 @@ const state = @import("../core/state.zig");
 const hypr = @import("../hypr/ipc.zig");
 const desktop = @import("../hypr/desktop.zig");
 const blur = @import("blur.zig");
-const glass = @import("glass.zig");
+
 const main_mod = @import("../main.zig");
 const log = @import("../core/log.zig");
 
@@ -251,15 +251,26 @@ fn registerMagItemLinked(w: ?*anyopaque, linked: ?*anyopaque) void {
 }
 
 /// Cursor distance (in icon slots) -> continuous scale position [0..steps-1].
-/// Gaussian falloff shaped like the real macOS dock: a sharp peak right at the
-/// cursor (full `animation.scale`), a steep decay for the immediate
-/// neighbors, and ~0 beyond `spread` slots. σ ≈ 0.4·spread gives the curve.
+/// A Cauchy (Lorentzian) "lens" curve — the shape of the real macOS dock. The
+/// old gaussian used σ = 0.4·spread, which left the neighbor at 1 slot at
+/// 0.707 of the peak — nearly the same size as the hovered icon, so the
+/// whole row looked flat and left/right were indistinguishable. Cauchy has a
+/// much sharper peak: with the default falloff (0.24, σ = 0.72 slots) the
+/// immediate neighbors drop to ~0.34 of the peak and a second neighbor to
+/// ~0.12 — clearly smaller, macOS-like — while the steep slope near the
+/// peak also makes the LEFT/RIGHT asymmetry real: a cursor at 1/4 of the
+/// hovered icon gives the near neighbor ~0.48 and the far one ~0.25. The
+/// effect reaches out to the `spread` limit, where it is hard-cut to 0 so
+/// icons beyond the radius stay perfectly still (matches the `spread`
+/// "effect radius" semantic in the config).
 fn magScale(dist_slots: f64, maxb: f64) f64 {
     const spread: f64 = @floatFromInt(state.cfg.magnify_spread);
     if (spread <= 0) return 0;
-    const sigma = spread * 0.4;
+    if (dist_slots >= spread) return 0; // hard cutoff: nothing moves past `spread`
+    const sigma = spread * state.cfg.magnify_falloff;
+    if (sigma <= 0) return 0;
     const t = dist_slots / sigma;
-    const falloff = @exp(-0.5 * t * t);
+    const falloff = 1.0 / (1.0 + t * t);
     return falloff * maxb;
 }
 
@@ -1632,7 +1643,4 @@ pub fn rebuildMainBox() void {
     if (makeSystemItem()) |si| c.gtk_box_append(mb, si);
 
     c.gtk_widget_show(mb);
-    // The box size may have changed (pinned apps added/removed) — keep the
-    // GL glass area the same size so the window hugs the box (texture 1:1).
-    glass.syncSize();
 }

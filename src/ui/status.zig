@@ -10,6 +10,7 @@ const std = @import("std");
 const c = @import("c"); // named module (build.zig)
 const state = @import("../core/state.zig");
 const widgets = @import("widgets.zig");
+const island = @import("island.zig");
 const log = @import("../core/log.zig");
 
 /// Run `argv` and return its stdout (allocated in `alloc`), or null on any
@@ -68,13 +69,14 @@ fn runCapture(alloc: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
 /// Fraction 0 hides the bar. Matched by mpris:desktopEntry (e.g. "firefox"),
 /// falling back to the focused app when the player is the focused one.
 fn pollProgress() void {
-    if (!state.cfg.progress_enabled) return;
+    if (!state.cfg.progress_enabled and !state.cfg.island_enabled) return;
 
-    // status|position(s)|length(us)|desktopEntry
+    // status|position(s)|length(us)|desktopEntry|title|artist|artUrl
     const meta = runCapture(state.scratch, &.{
-        "playerctl", "metadata", "--format", "{{status}}|{{position}}|{{mpris:length}}|{{mpris:desktopEntry}}",
+        "playerctl", "metadata", "--format", "{{status}}|{{position}}|{{mpris:length}}|{{mpris:desktopEntry}}|{{xesam:title}}|{{xesam:artist}}|{{mpris:artUrl}}",
     }) orelse {
-        widgets.setProgress("", 0); // no player → hide all
+        widgets.setProgress("", 0);
+        island.updateMusic("", "", "", "");
         return;
     };
     defer state.scratch.free(meta);
@@ -82,6 +84,7 @@ fn pollProgress() void {
     const line = std.mem.trim(u8, meta, " \t\r\n");
     if (line.len == 0) {
         widgets.setProgress("", 0);
+        island.updateMusic("", "", "", "");
         return;
     }
     var it = std.mem.splitScalar(u8, line, '|');
@@ -89,6 +92,12 @@ fn pollProgress() void {
     const pos_str = it.next() orelse "0";
     const len_str = it.next() orelse "0";
     const entry = std.mem.trim(u8, it.next() orelse "", " \t");
+    const title = std.mem.trim(u8, it.next() orelse "", " \t");
+    const artist = std.mem.trim(u8, it.next() orelse "", " \t");
+    const art_url = std.mem.trim(u8, it.next() orelse "", " \t");
+
+    // Update the Dynamic Island with music metadata (album art included)
+    island.updateMusic(title, artist, status, art_url);
 
     if (!std.mem.eql(u8, status, "Playing")) {
         widgets.setProgress("", 0);
@@ -102,10 +111,10 @@ fn pollProgress() void {
     }
     const fraction = @max(0.0, @min(1.0, pos / (len_us / 1_000_000.0)));
 
-    // Show the bar on the app that owns the player (matched by desktopEntry,
-    // e.g. "firefox"), falling back to the focused app when the entry doesn't
-    // match anything in the dock (e.g. player "chromium" vs class
-    // "Google-chrome"). setProgress("", …) with an empty class hides all.
+    // Update island progress bar
+    island.updateMusicProgress(fraction);
+
+    // Show the bar on the app that owns the player
     var target = entry;
     var matched = false;
     const classes = widgets.statusClasses(state.scratch);
@@ -126,7 +135,13 @@ fn pollProgress() void {
 // Notifications (makoctl)
 // ---------------------------------------------------------------------------
 
-const Notification = struct { app: []const u8 = "" };
+const Notification = struct {
+    app: []const u8 = "", // app-name (used for badge matching + island icon fallback)
+    icon: []const u8 = "", // app-icon (the actual icon id, preferred for the island)
+    id: u32 = 0,
+    summary: []const u8 = "",
+    body: []const u8 = "",
+};
 
 /// Parse `makoctl list` into a flat list of app identifiers. Accepts both
 /// output formats across mako versions:
@@ -145,16 +160,34 @@ fn parseMakoList(alloc: std.mem.Allocator, data: []const u8) []Notification {
         for (notifs.array.items) |n| {
             if (n != .object) continue;
             var app: []const u8 = "";
+            var icon: []const u8 = "";
+            var id: u32 = 0;
+            var summary: []const u8 = "";
+            var body: []const u8 = "";
             if (n.object.get("app-name")) |v| {
                 if (v == .string) app = v.string;
             }
-            if (app.len == 0) {
-                if (n.object.get("app-icon")) |v| {
-                    if (v == .string) app = v.string;
-                }
+            if (n.object.get("app-icon")) |v| {
+                if (v == .string) icon = v.string;
             }
-            if (app.len > 0) {
-                out.append(alloc, .{ .app = alloc.dupe(u8, app) catch continue }) catch {};
+            if (app.len == 0) app = icon; // last-resort app fallback
+            if (n.object.get("id")) |v| {
+                if (v == .integer) id = @intCast(v.integer);
+            }
+            if (n.object.get("summary")) |v| {
+                if (v == .string) summary = v.string;
+            }
+            if (n.object.get("body")) |v| {
+                if (v == .string) body = v.string;
+            }
+            if (app.len > 0 or id != 0) {
+                out.append(alloc, .{
+                    .app = alloc.dupe(u8, app) catch continue,
+                    .icon = alloc.dupe(u8, icon) catch "",
+                    .id = id,
+                    .summary = alloc.dupe(u8, summary) catch "",
+                    .body = alloc.dupe(u8, body) catch "",
+                }) catch {};
             }
         }
         return out.toOwnedSlice(alloc) catch &.{};
@@ -215,14 +248,60 @@ fn appMatchesClass(app: []const u8, class: []const u8) bool {
     return false;
 }
 
-/// Poll makoctl list, count notifications per app and push the badge counts.
+/// Seen mako notification ids: a small ring so NEW notifications (ids we've
+/// never seen before) pop out of the Dynamic Island exactly once, and the
+/// badge poll doesn't re-fire old ones after a dockh restart or mako restart.
+var seen_notif_ids: [64]u32 = [_]u32{0} ** 64;
+var seen_notif_count: usize = 0;
+
+fn isNewNotifId(id: u32) bool {
+    if (id == 0) return false;
+    for (seen_notif_ids[0..seen_notif_count]) |seen| {
+        if (seen == id) return false;
+    }
+    if (seen_notif_count < seen_notif_ids.len) {
+        seen_notif_ids[seen_notif_count] = id;
+        seen_notif_count += 1;
+    } else {
+        // ring full: shift and drop the oldest
+        for (1..seen_notif_ids.len) |i| seen_notif_ids[i - 1] = seen_notif_ids[i];
+        seen_notif_ids[seen_notif_ids.len - 1] = id;
+    }
+    return true;
+}
+
+/// Poll makoctl list: count notifications per app for the dock badges AND
+/// detect brand-new notifications (by id) to pop out of the Dynamic Island.
 fn pollBadges() void {
-    if (!state.cfg.badge_enabled) return;
+    if (!state.cfg.badge_enabled and !state.cfg.island_enabled) return;
     const data = runCapture(state.scratch, &.{ "makoctl", "list" }) orelse return;
     defer state.scratch.free(data);
 
     const notifs = parseMakoList(state.scratch, data);
     defer state.scratch.free(notifs);
+
+    // NEW notification -> Dynamic Island pop-out (most recent one wins).
+    // Only meaningful from the JSON branch, which carries ids.
+    if (state.cfg.island_enabled) {
+        var new_id: u32 = 0;
+        var newest_idx: ?usize = null;
+        for (notifs, 0..) |n, i| {
+            if (n.id != 0 and isNewNotifId(n.id)) {
+                if (newest_idx == null or n.id > new_id) {
+                    new_id = n.id;
+                    newest_idx = i;
+                }
+            }
+        }
+        if (newest_idx) |idx| {
+            const n = notifs[idx];
+            const title = if (n.summary.len > 0) n.summary else n.app;
+            // Pass the real icon id (app-icon) so the island shows the app's
+            // icon instead of trying to resolve the desktop-entry name.
+            const icon_name = if (n.icon.len > 0) n.icon else n.app;
+            island.showNotification(n.app, icon_name, title, n.body);
+        }
+    }
 
     // classes currently shown in the dock
     const classes = widgets.statusClasses(state.scratch);
@@ -235,6 +314,123 @@ fn pollBadges() void {
         }
         widgets.setBadge(class, count);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Volume / brightness OSD (wpctl / brightnessctl)
+// ---------------------------------------------------------------------------
+// Poll the current volume and brightness; when a value CHANGES, pop the OSD
+// slider out of the Dynamic Island (macOS-style). The polls are cheap and run
+// on the 1s progress timer only when the island is enabled.
+
+var last_volume: f64 = -1;
+var last_volume_muted = false;
+var last_brightness: f64 = -1;
+
+/// `wpctl get-volume @DEFAULT_AUDIO_SINK@` → "Volume: 0.45" / "…[MUTED]"
+fn pollVolume() void {
+    if (!state.cfg.island_enabled) return;
+    const out = runCapture(state.scratch, &.{ "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@" }) orelse return;
+    defer state.scratch.free(out);
+    const line = std.mem.trim(u8, out, " \t\r\n");
+    if (line.len == 0) return;
+    const colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse return;
+    var val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+    const muted = std.mem.indexOf(u8, val, "[MUTED]") != null;
+    if (muted) {
+        val = std.mem.trim(u8, val[0 .. val.len - "[MUTED]".len], " \t");
+    }
+    const vol = std.fmt.parseFloat(f64, val) catch return;
+    // First sample: seed the baseline WITHOUT popping the OSD — otherwise the
+    // island flashes "Volume" on every dockh start with no user input.
+    if (last_volume < 0) {
+        last_volume = vol;
+        last_volume_muted = muted;
+        return;
+    }
+    if (vol == last_volume and muted == last_volume_muted) return; // unchanged
+    last_volume = vol;
+    last_volume_muted = muted;
+
+    const icon = if (muted or vol <= 0.001)
+        "audio-volume-muted-symbolic"
+    else if (vol < 0.5)
+        "audio-volume-low-symbolic"
+    else
+        "audio-volume-high-symbolic";
+    island.showOsd(icon, if (muted) "Muted" else "Volume", vol);
+}
+
+/// `brightnessctl -m get` → "DEVICE,CLASS,PERCENT,VALUE,MAX" — take PERCENT.
+fn pollBrightness() void {
+    if (!state.cfg.island_enabled) return;
+    const out = runCapture(state.scratch, &.{ "brightnessctl", "-m", "get" }) orelse return;
+    defer state.scratch.free(out);
+    const line = std.mem.trim(u8, out, " \t\r\n");
+    if (line.len == 0) return;
+    var it = std.mem.splitScalar(u8, line, ',');
+    _ = it.next(); // device
+    _ = it.next(); // class
+    const pct_str = std.mem.trim(u8, it.next() orelse return, " \t");
+    const pct = std.fmt.parseFloat(f64, pct_str) catch return;
+    // First sample: baseline only, no startup pop (see pollVolume).
+    if (last_brightness < 0) {
+        last_brightness = pct;
+        return;
+    }
+    if (pct == last_brightness) return; // unchanged
+    last_brightness = pct;
+    island.showOsd("display-brightness-symbolic", "Brightness", pct / 100.0);
+}
+
+// ---------------------------------------------------------------------------
+// Battery (idle pill + low-battery warning)
+// ---------------------------------------------------------------------------
+// Reads /sys/class/power_supply/BAT*/capacity + status directly (no tools),
+// on a slow 30s timer. Pushes the charge state to the island, which shows the
+// percentage next to the clock and warns once below 20%.
+
+fn batteryCapacity() ?i32 {
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var path: [80:0]u8 = undefined;
+        const p = std.fmt.bufPrint(&path, "/sys/class/power_supply/BAT{d}/capacity", .{i}) catch break;
+        path[p.len] = 0;
+        var buf: [32]u8 = undefined;
+        const n = readFileBuf(path[0..p.len :0].ptr, &buf);
+        if (n == 0) continue;
+        const val = std.fmt.parseInt(i32, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
+        return @max(0, @min(100, val));
+    }
+    return null;
+}
+
+fn batteryCharging() bool {
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var path: [80:0]u8 = undefined;
+        const p = std.fmt.bufPrint(&path, "/sys/class/power_supply/BAT{d}/status", .{i}) catch break;
+        path[p.len] = 0;
+        var buf: [32]u8 = undefined;
+        const n = readFileBuf(path[0..p.len :0].ptr, &buf);
+        if (n == 0) continue;
+        const st = std.mem.trim(u8, buf[0..n], " \t\r\n");
+        return std.mem.eql(u8, st, "Charging") or std.mem.eql(u8, st, "Full");
+    }
+    return false;
+}
+
+fn pollBattery() void {
+    if (!state.cfg.island_enabled) return;
+    const pct = batteryCapacity();
+    // Skip the status file read entirely when no battery is present.
+    const charging = if (pct != null) batteryCharging() else false;
+    island.setBattery(pct orelse 0, charging, pct != null);
+}
+
+fn onBatteryTimer(_: ?*anyopaque) callconv(.c) c_int {
+    pollBattery();
+    return 1; // keep the timer
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +638,10 @@ fn pollSystem() void {
 
 fn onProgressTimer(_: ?*anyopaque) callconv(.c) c_int {
     pollProgress();
+    // OSD sliders ride the same 1s tick (each early-returns when its value
+    // is unchanged, so they're idle-cheap).
+    pollVolume();
+    pollBrightness();
     return 1; // keep the timer
 }
 
@@ -466,6 +666,10 @@ pub fn setup() void {
     _ = c.g_timeout_add(2000, @ptrCast(&onBadgeTimer), null);
     const ms: c_uint = @intCast(@max(state.cfg.system_interval_ms, 500));
     _ = c.g_timeout_add(ms, @ptrCast(&onSystemTimer), null);
+    // Battery is slow-moving: a 30s tick plus an immediate first read so the
+    // idle pill shows the percentage from the start.
+    _ = c.g_timeout_add(30_000, @ptrCast(&onBatteryTimer), null);
+    pollBattery();
     if (state.cfg.progress_enabled) {
         log.debug("status: media progress polling on (playerctl, 1s)", .{});
     }

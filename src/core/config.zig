@@ -30,7 +30,7 @@ pub const Config = struct {
     autohide: bool = false,
     hide_on_activity: bool = false, // intellihide: hide when the active ws has windows
     resident: bool = false,
-    icon_size: i32 = 40,
+    icon_size: i32 = 48,
     num_workspaces: i32 = 10,
     target_output: []const u8 = "",
 
@@ -43,7 +43,7 @@ pub const Config = struct {
     // [launcher]
     launcher_cmd: []const u8 = "nwg-drawer",
     launcher_icon: []const u8 = "",
-    no_launcher: bool = true, // launcher hidden by default (set show = true to enable)
+    no_launcher: bool = false,
     launcher_pos: []const u8 = "end", // start | end
 
     // [hotspot]
@@ -64,7 +64,13 @@ pub const Config = struct {
     // sub-pixel (~0.06 px on 32 px icons), so instant swaps look continuous.
     // `duration_ms` is the exponential ease constant (higher = smoother).
     magnify_enabled: bool = true,
-    magnify_spread: i32 = 3, // effect radius in icon slots from the cursor
+    magnify_spread: i32 = 3, // effect radius in icon slots from the cursor (hard cut-off)
+    // Curve sharpness: sigma = spread * falloff (Cauchy lens curve). Lower =
+    // a sharper peak — the hovered icon dominates and the immediate
+    // neighbors drop off fast (macOS look); higher = a flatter wave where
+    // neighbors stay close in size to the peak. The curve is hard-cut to 0
+    // beyond `spread` slots, so `spread` stays the true effect radius.
+    magnify_falloff: f64 = 0.24, // sigma multiplier (0.05..0.5, lower = sharper)
     magnify_steps: usize = 256, // bucket ladder size (sub-pixel steps = smooth)
     magnify_duration_ms: i64 = 40, // ease time constant in ms (higher = smoother follow)
     // macOS settle spring: when the pointer stops over the dock, the icons
@@ -100,22 +106,26 @@ pub const Config = struct {
     icon_shadow: bool = false,
     icon_shadow_radius: f64 = 8, // blur radius in px; 0 = sharp edge
 
-    // [glass] — real GLSL "liquid glass" panel rendered by a GtkGLArea behind
-    // the icons (SDF rounded rect, refraction of the grim-captured desktop,
-    // chromatic dispersion, specular bevel, frost, depth). Requires grim and
-    // an OpenGL 3.3 context; falls back to the pure-CSS glass automatically.
-    // OFF by default: the GL context + desktop re-capture add ~70 MB of RSS,
-    // so the default is the lightweight pure-CSS glass. Opt in per-user.
+    // [glass] — DEPRECATED: kept as stubs so glass.zig compiles but the
+    // feature is disabled by default and the config GUI no longer exposes it.
     glass_enabled: bool = false,
-    glass_radius: f32 = 22, // corner radius px
-    glass_margin: f32 = 8, // inset px — must match #dockh-box CSS margin
-    glass_refraction: f32 = 0.55,
-    glass_dispersion: f32 = 0.25,
-    glass_splay: f32 = 0.6,
-    glass_frost: f32 = 0.35,
-    glass_depth: f32 = 0.2,
-    glass_light_angle: f32 = -45, // degrees
+    glass_radius: f32 = 18,
+    glass_margin: f32 = 6,
+    glass_refraction: f32 = 0.5,
+    glass_dispersion: f32 = 0.2,
+    glass_splay: f32 = 0.5,
+    glass_frost: f32 = 0.3,
+    glass_depth: f32 = 0.15,
+    glass_light_angle: f32 = -45,
     glass_alpha: f32 = 0.85,
+
+    // [memory] — DEPRECATED stubs
+    memory_watch_sec: i64 = 0,
+    memory_trim_above_mb: i64 = 0,
+    memory_glass_off_mb: i64 = 0,
+
+    // [island] — Dynamic Island: floating notification/music widget at top of screen
+    island_enabled: bool = true,
 
     // [progress] — macOS-style media progress bar under the icon (playerctl).
     // Off by default: it needs playerctl and many users find the bar noisy.
@@ -142,14 +152,7 @@ pub const Config = struct {
     system_cpu: bool = true,
     system_temp: bool = true,
 
-    // [memory] — RSS watchdog: guarantees dockh never blows up, no matter
-    // what GTK/Mesa do. `watch_sec` samples RSS; above `trim_above_mb` it
-    // forces malloc_trim; above `glass_off_mb` it drops the liquid-glass
-    // shader entirely (hard ceiling — the dock falls back to CSS glass,
-    // freeing the GL context, ~80 MB). 0 disables that step.
-    memory_watch_sec: i64 = 5,
-    memory_trim_above_mb: i64 = 165,
-    memory_glass_off_mb: i64 = 210,
+
 
     // [apps]
     css_file: []const u8 = "style.css",
@@ -250,6 +253,14 @@ fn applyKey(alloc: std.mem.Allocator, cfg: *Config, section: []const u8, key: []
 
     if (eq(full, "magnify.enabled")) return setBool(&cfg.magnify_enabled, value);
     if (eq(full, "magnify.spread")) return setInt(&cfg.magnify_spread, value);
+    if (eq(full, "magnify.falloff")) {
+        var f: f64 = cfg.magnify_falloff;
+        setFloat(&f, value) catch {};
+        if (f < 0.05) f = 0.05;
+        if (f > 0.5) f = 0.5;
+        cfg.magnify_falloff = f;
+        return;
+    }
     if (eq(full, "magnify.steps")) {
         // Clamp the ladder size: theme.zig emits one CSS rule per bucket, so a
         // pathological value would balloon the generated stylesheet on every
@@ -324,6 +335,10 @@ fn applyKey(alloc: std.mem.Allocator, cfg: *Config, section: []const u8, key: []
         return;
     }
 
+    if (eq(full, "island.enabled")) return setBool(&cfg.island_enabled, value);
+    if (eq(full, "progress.enabled")) return setBool(&cfg.progress_enabled, value);
+
+    // [glass] deprecated stubs — accepted but ignored by the GUI
     if (eq(full, "glass.enabled")) return setBool(&cfg.glass_enabled, value);
     if (eq(full, "glass.radius")) return setFloatF32(&cfg.glass_radius, value);
     if (eq(full, "glass.margin")) return setFloatF32(&cfg.glass_margin, value);
@@ -335,7 +350,7 @@ fn applyKey(alloc: std.mem.Allocator, cfg: *Config, section: []const u8, key: []
     if (eq(full, "glass.light_angle")) return setFloatF32(&cfg.glass_light_angle, value);
     if (eq(full, "glass.alpha")) return setFloatF32(&cfg.glass_alpha, value);
 
-    if (eq(full, "progress.enabled")) return setBool(&cfg.progress_enabled, value);
+    // [memory] deprecated stubs
     if (eq(full, "memory.watch_sec")) return setInt(&cfg.memory_watch_sec, value);
     if (eq(full, "memory.trim_above_mb")) return setInt(&cfg.memory_trim_above_mb, value);
     if (eq(full, "memory.glass_off_mb")) return setInt(&cfg.memory_glass_off_mb, value);

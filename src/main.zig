@@ -17,8 +17,9 @@ const hypr = @import("hypr/ipc.zig");
 const desktop = @import("hypr/desktop.zig");
 const widgets = @import("ui/widgets.zig");
 const blur = @import("ui/blur.zig");
-const glass = @import("ui/glass.zig");
+
 const status_mod = @import("ui/status.zig");
+const island = @import("ui/island.zig");
 const cssmod = @import("ui/theme.zig");
 const fs = @import("fs"); // named module (build.zig)
 const log = @import("core/log.zig");
@@ -382,13 +383,7 @@ fn setupMainWindow() void {
 
     c.gtk_box_append(outer_box, alignment_box);
     c.gtk_box_append(alignment_box, main_box);
-    // Real GLSL liquid glass: a GtkOverlay with the glass behind and the box
-    // on top. Null (no GL / no grim) → plain box = pure-CSS glass fallback.
-    if (glass.createOverlay(outer_box)) |overlay| {
-        c.gtk_window_set_child(win, overlay);
-    } else {
-        c.gtk_window_set_child(win, outer_box);
-    }
+    c.gtk_window_set_child(win, outer_box);
 
     state.outer_box = outer_box;
     state.alignment_box = alignment_box;
@@ -760,8 +755,6 @@ fn handleHyprEventLine(line: []const u8) void {
             state.active_ws_id = std.fmt.parseInt(i32, id_part, 10) catch state.active_ws_id;
         }
         refreshClients();
-        // the wallpaper behind the glass changed with the workspace
-        glass.onBackgroundChanged();
     } else if (std.mem.startsWith(u8, line, "focusedmon>>")) {
         // focusedmon>>MONITOR,WORKSPACEID
         const rest = std.mem.trim(u8, line["focusedmon>>".len..], " \r");
@@ -770,15 +763,11 @@ fn handleHyprEventLine(line: []const u8) void {
             state.active_ws_id = std.fmt.parseInt(i32, id_part, 10) catch state.active_ws_id;
         }
         refreshClients();
-        glass.onBackgroundChanged();
     } else if (std.mem.startsWith(u8, line, "openwindow>>") or
         std.mem.startsWith(u8, line, "closewindow>>") or
         std.mem.startsWith(u8, line, "fullscreen>>"))
     {
-        // a window appeared/disappeared over the dock area — refresh the
-        // glass background so no stale window is left in the texture
         refreshClients();
-        glass.onBackgroundChanged();
     } else if (std.mem.startsWith(u8, line, "movewindow>>")) {
         // dragging windows fires movewindow constantly — rebuild the icons
         // but skip the (debounced) background capture storm
@@ -911,7 +900,6 @@ fn configStructuralChanged(new: *const config_mod.Config) bool {
     if (!std.mem.eql(u8, o.hotspot_layer, new.hotspot_layer)) return true;
     if (o.hotspot_size != new.hotspot_size) return true;
     if (!std.mem.eql(u8, o.css_file, new.css_file)) return true;
-    if (o.glass_enabled != new.glass_enabled) return true;
     // Lists (pinned / ignore classes / workspaces) also rebuild the dock.
     if (o.pinned.len != new.pinned.len) return true;
     for (o.pinned, new.pinned) |a, b| if (!std.mem.eql(u8, a, b)) return true;
@@ -965,8 +953,6 @@ fn applyConfigReload() void {
 
     // Magnify ladder / hover scale / transitions are generated CSS — swap it.
     cssmod.loadAnimation(&state.cfg);
-    // Glass uniforms are read per-render from state.cfg — queue a redraw.
-    glass.refresh();
     // Badge/progress/system polls read state.cfg on their next tick.
     if (old_badge != state.cfg.badge_enabled) {
         log.info("config live: badge {s}", .{if (state.cfg.badge_enabled) "on" else "off"});
@@ -1177,8 +1163,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     setupMemoryTrim();
 
     // Scene-graph blur backend + status polls (media progress / badges) are
-    // independent of the window being mapped, so arm them early.
+    // independent of the window being mapped, so arm them early. The Dynamic
+    // Island is a separate always-visible layer-shell pill — bring it up
+    // BEFORE the status polls so the immediate battery read finds its label.
     blur.init();
+    island.setup();
     status_mod.setup();
 
     refreshClients();
@@ -1188,10 +1177,6 @@ pub fn main(init: std.process.Init.Minimal) void {
         // start hidden (autohide), unless intellihide has an empty desktop
         _ = c.g_timeout_add(500, @ptrCast(&onInitialHide), null);
     }
-
-    // Capture the desktop behind the dock BEFORE the window is shown, so the
-    // dock itself never lands in its own liquid-glass background texture.
-    glass.captureStartup();
 
     if (state.win) |w| c.gtk_widget_show(w);
 
@@ -1275,11 +1260,7 @@ fn onMemoryWatchdog(_: ?*anyopaque) callconv(.c) c_int {
             log.warn("memory watchdog: RSS {d} MB ≥ {d} — heap trimmed", .{ rss, state.cfg.memory_trim_above_mb });
         }
     }
-    if (state.cfg.memory_glass_off_mb > 0 and rss >= state.cfg.memory_glass_off_mb) {
-        if (glass.emergencyDisable()) {
-            log.warn("memory watchdog: RSS {d} MB ≥ {d} — dropped liquid glass (CSS glass)", .{ rss, state.cfg.memory_glass_off_mb });
-        }
-    }
+    // Glass feature removed - no action needed
     return 1; // keep watching
 }
 

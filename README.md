@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🧊 dockh
+# dockh
 
-**A dock for Hyprland written in Zig — GTK4 + GSK, liquid glass, zero polling.**
+**A dock for Hyprland written in Zig — GTK4 + GSK, zero polling.**
 
 A modern rewrite of [nwg-dock-hyprland](https://github.com/nwg-piotr/nwg-dock-hyprland)
 (Go/GTK3) with no Go dependencies, no garbage collector and no generated
@@ -17,7 +17,7 @@ bindings: the C ABI is hand-declared in `src/c.zig`.
 | | |
 |---|---|
 | 🪟 **GTK4 + GSK** | Hardware rendering (Vulkan/OpenGL) and modern CSS with `transform: scale() / translateY() / rotate()` and `transition` with `cubic-bezier` curves — without disturbing the container's fixed layout. |
-| 🧊 **Liquid glass (real GLSL)** | The panel is rendered by a **GtkGLArea running a fragment shader** — SDF rounded rect, refraction of the desktop behind (captured with grim), chromatic dispersion, specular bevel, frost blur and depth tint — with automatic fallback to the CSS glass. See [Theming](#theming). |
+
 | 📌 **Pinned apps** | Keep your favorite apps in the dock and launch them with one click; pin/unpin from the context menu. Separated from running apps by a divider, with *ghost* (not running) and *running* states visible in CSS. |
 | 🖱️ **Autohide with hotspot** | Per-monitor invisible windows with configurable delay (detector + strip), no polling. |
 | 🧠 **Workspace intellihide** | With `hide_on_activity = true` the dock hides while the active workspace has windows and reappears when it empties. |
@@ -111,7 +111,7 @@ The first run creates `~/.config/dockh/` with default `config.toml` and
 ```bash
 dockh                       # bottom bar, centered, bottom layer (behind windows)
 dockh -p top -f             # top bar, full width
-dockh -d -i 40              # autohide with hotspot, 40px icons
+dockh -d -i 36              # autohide with hotspot, 36px icons
 dockh -o DP-1 -p left       # left dock on the DP-1 monitor
 dockh -r                    # resident without hotspot (toggle via signal)
 dockh -ha -d                # intellihide + hotspot (very comfortable)
@@ -128,7 +128,7 @@ dockh -ha -d                # intellihide + hotspot (very comfortable)
 -f                       take the full width/height
 -l <overlay|top|bottom>  layer (bottom — behind windows)
 -x                       exclusive zone (reserves space, forces top)
--i <px>                  icon size (40)
+-i <px>                  icon size (36)
 -o <output>              target monitor, e.g. DP-1
 -c <cmd>                 launcher button command (nwg-drawer)
 -ico <icon>              launcher icon (name or path)
@@ -216,7 +216,7 @@ hyprctl layers          # you should see dockh and dockh-hotspot (if using autoh
 
 `~/.config/dockh/config.toml` — sections `[dock]`, `[margins]`,
 `[launcher]`, `[appearance]`, `[hotspot]`, `[animation]`, `[magnify]`,
-`[progress]`, `[badge]`, `[system]`, `[glow]`, `[glass]`, `[memory]`,
+`[progress]`, `[badge]`, `[system]`, `[glow]`,
 `[apps]`:
 
 ```toml
@@ -229,7 +229,7 @@ exclusive = false          # reserve space (forces layer = top)
 autohide = false           # hide with hotspot
 hide_on_activity = false   # intellihide: hide if the active workspace has windows
 resident = false           # always visible, toggle via signal
-icon_size = 40           # macOS-style icons (magnify on hover)
+icon_size = 36           # macOS-style icons (magnify on hover)
 num_workspaces = 10
 target_output = ""         # "DP-1" — empty = focused monitor
 
@@ -267,6 +267,9 @@ curve = "cubic-bezier(0.34, 1.56, 0.64, 1)"   # playful overshoot
 [magnify]
 enabled = true             # macOS-style proximity magnify
 spread = 3                 # effect radius in icon slots from the cursor
+falloff = 0.24             # curve sharpness: sigma = spread * falloff. Lower = sharper
+                           # peak (hovered icon dominates, neighbors drop fast — macOS look);
+                           # higher = flatter wave (neighbors stay close to the peak)
 steps = 256                # bucket ladder size: 256 = sub-pixel steps (~0.06 px)
 duration_ms = 40           # exponential ease constant in ms (higher = smoother follow)
 spring = true              # macOS settle bounce when the pointer stops over the dock
@@ -292,35 +295,6 @@ enabled = false            # in-dock blur halo behind the active app's icon (off
                           #   copy looks like a grainy "shadow" while magnified)
 radius = 8                # gaussian radius in px (0 disables)
 
-[glass]
-# Real GLSL "liquid glass" panel rendered by a GtkGLArea behind the icons
-# (SDF rounded rect, refraction of the grim-captured desktop, chromatic
-# dispersion, specular bevel, frost blur, depth tint). Re-captured on
-# workspace changes. Falls back to the pure-CSS glass if GL or grim fail.
-# OFF by default: the GL context + desktop re-capture add ~70 MB of RSS,
-# so the lightweight pure-CSS glass is the default. Opt in per-user.
-enabled = false
-radius = 22              # corner radius (px)
-margin = 8               # inset (px) — must match the #dockh-box CSS margin
-refraction = 0.55        # 0..1 bend strength at the panel edges
-splay = 0.6              # 0..1 width of the edge curvature (lens falloff)
-dispersion = 0.25        # 0..1 chromatic separation (prism effect)
-frost = 0.35             # 0..1 frosted blur radius
-depth = 0.2              # 0..1 volumetric tint toward the center
-light_angle = -45        # degrees: direction of the specular bevel highlight
-alpha = 0.85             # 0..1 overall panel opacity
-
-[memory]
-# RSS watchdog — guarantees dockh never eats the machine, no matter what
-# GTK or Mesa do. The dock samples its own RSS every watch_sec seconds:
-#   trim_above_mb:  force malloc_trim when RSS exceeds this (MiB)
-#   glass_off_mb:   drop the liquid-glass shader when RSS exceeds this (MiB)
-#                   → HARD CEILING: falls back to the pure-CSS glass
-#                   (~75 MB, frees the GL context). 0 = never.
-watch_sec = 5
-trim_above_mb = 165
-glass_off_mb = 210
-
 [apps]
 css_file = "style.css"
 pinned = ["firefox", "kitty"]   # also from the dock's right-click menu
@@ -333,7 +307,7 @@ ignore_workspaces = []          # e.g. ["special", "10"]
 > only used on first run.
 >
 > 🔄 Both `style.css` **and** `config.toml` hot-reload (see
-> [Hot reload](#hot-reload)). Soft config sections — `[magnify]`, `[glass]`
+> [Hot reload](#hot-reload)). Soft config sections — `[magnify]`
 > params, `[badge]`, `[progress]`, `[glow]`, `[system]`, `[animation]`,
 > `[hotspot]` delay, autohide — re-apply **live, no restart**. Only
 > structural keys (position, layer, margins, icon_size, pinned, lists) still
@@ -341,70 +315,23 @@ ignore_workspaces = []          # e.g. ["special", "10"]
 
 ---
 
-## 🎨 Theming (liquid glass)
+## 🎨 Theming
 
-dockh has **two glass engines**, selected automatically:
+dockh uses a clean CSS-based theming system. Edit `~/.config/dockh/style.css` to customize the dock appearance.
 
-| Engine | When | What it renders |
-|---|---|---|
-| **CSS glass** (default) | `glass.enabled = false` (default), or no GL / no grim | The classic theme: `#dockh-box` background gradient + compositor blur (layerrule). Light on RAM. |
-| **GLSL shader** (opt-in) | `[glass] enabled = true` and GL + grim available | A `GtkGLArea` runs the full optical model behind the icons: SDF rounded rect, splay edge normals, refraction of the grim-captured desktop, chromatic dispersion, specular bevel lit by `light_angle`, frost and depth. Adds ~70 MB of Mesa RSS. |
+### Compositor blur
 
-### The GLSL shader (opt-in) ✨
-
-When the shader is active, the window gets the `.glass-on` class and the CSS
-box chrome steps aside (`#dockh-window.glass-on #dockh-box` becomes
-transparent) so only the shader panel + icons are drawn. The desktop region
-behind the dock is captured with **grim** at startup (before the window is
-shown, so the dock never appears in its own background) and re-captured on
-workspace changes — debounced, with a quick hide/show so the recapture is
-clean.
-
-> 🔍 **Why GtkGLArea?** `GskGLShaderNode` is deprecated since GTK 4.16 — the
-> `ngl` (Vulkan) renderer silently ignores it. A `GtkGLArea` gives dockh a
-> real GL 3.3 context where the full GLSL runs, composited over the
-> transparent layer shell. No per-frame cost: the shader only renders when
-> queued, so the dock stays at 60 fps with zero extra load.
-
-Tune the effect from `config.toml`:
-
-```toml
-[glass]
-enabled = true
-refraction = 0.55        # how much the background bends at the edges
-splay = 0.6              # width of the edge curvature (lens falloff)
-dispersion = 0.25        # chromatic separation (prism effect)
-frost = 0.35             # frosted blur of the captured desktop
-light_angle = -45        # degrees: direction of the specular bevel
-```
-
-### The CSS glass (fallback) 🧊
-
-Set `glass.enabled = false` (or remove `grim`) and the look comes from CSS
-(`~/.config/dockh/style.css`) + compositor blur. Add to your `hyprland.conf`
-(**Hyprland 0.55+ syntax**, with `match:namespace` and the underscore in
-`ignore_alpha`):
+Add to your `hyprland.conf` to get blur behind the dock:
 
 ```ini
-layerrule = blur on, match:namespace dockh
-layerrule = ignore_alpha 0.5, match:namespace dockh
-layerrule = blur on, match:namespace dockh-hotspot
+layerrule = blur, dockh
+layerrule = ignorealpha 0.5, dockh
+layerrule = blur, dockh-hotspot
 ```
 
-> 🔍 **Verified against Hyprland 0.55.4**: the effect is called `ignore_alpha`
-> (not `ignorealpha`) — the exact name lives in the `eLayerRuleEffect` enum in
-> `src/desktop/rule/layerRule/`. `blur` takes `on|off`, `ignore_alpha` a float
-> 0–1. On older versions (< 0.45) the form was
-> `layerrule = blur, dockh` / `layerrule = ignorealpha 0.5, dockh`.
->
-> On Omarchy you can put them at the end of `~/.config/hypr/hyprland.conf`
-> (the "Add any other personal Hyprland configuration below" zone).
+### In-dock blur (active app halo)
 
-### In-dock blur (active app halo) ✨
-
-On top of the compositor blur (layerrule), dockh **blurs the active app's own
-icon** and draws it behind as a soft halo — without depending on Hyprland. The
-backend is chosen automatically at runtime:
+dockh **blurs the active app's own icon** and draws it behind as a soft halo. The backend is chosen automatically at runtime:
 
 | Backend | When | How |
 |---|---|---|
@@ -562,7 +489,7 @@ ignored.
 `config.toml` **hot-reloads too**: the dock watches the file (like
 `dockh-config` does) and re-applies the change **live**:
 
-- **Soft keys** — `[magnify]` (spread, steps, springs, ghost), `[glass]`
+- **Soft keys** — `[magnify]` (spread, steps, springs, ghost)
   parameters (refraction, dispersion, frost, alpha…), `[badge]`,
   `[progress]`, `[glow]`, `[system]`, `[animation]`, hotspot delay,
   autohide/intellihide — are pushed into the running dock **without a
@@ -658,9 +585,11 @@ effect live.
 ### Proximity magnify (macOS style) 🔍
 
 With `[magnify] enabled = true`, the dock scales icons **by distance to the
-cursor** with a **gaussian** curve identical to the macOS dock: the icon under
-the mouse reaches `animation.scale` (1.5×), immediate neighbors fall off fast
-(σ ≈ 0.4·spread) and distant ones stay at 1.0.
+cursor** with a **Cauchy lens curve** identical to the macOS dock: the icon
+under the mouse reaches `animation.scale` (1.5×), immediate neighbors drop to
+~0.34 of the peak (clearly smaller, `falloff = 0.24`), a cursor off-center
+makes the left and right neighbors visibly different sizes (macOS asymmetry),
+and icons at `spread` slots or beyond stay at 1.0 (hard cut-off).
 
 The scale is driven by a ladder of `.dockh-mag-N` CSS buckets (N = 0…steps-1,
 generated at startup and on config reload), but the fluidity comes from how
@@ -693,6 +622,8 @@ center. When the pointer leaves, the same easing shrinks the icons back to
 [magnify]
 enabled = true             # false returns to simple hover
 spread = 3                 # higher = more neighbor icons affected
+falloff = 0.24             # curve sharpness: sigma = spread * falloff — lower = a sharper
+                           # peak so neighbors drop fast and left/right read asymmetrically
 steps = 256                # bucket ladder size: 256 = sub-pixel steps, continuous look
 duration_ms = 40           # exponential ease constant in ms (higher = smoother)
 spring = true              # macOS settle bounce: tiny damped overshoot when the pointer stops
@@ -711,7 +642,7 @@ ghost_scale = 1.35         # peak scale while fading (1.0 = no growth)
 ```
 
 > 🔍 **Why `steps = 256`?** The classic mistake is a coarse ladder (e.g. 32
-> buckets = ~0.5 px jumps on 32 px icons) plus an overshooting CSS curve —
+> buckets = ~0.5 px jumps on 36 px icons) plus an overshooting CSS curve —
 > every bucket change bounces the icon past its target and back. 256 buckets
 > make each step ~0.06 px (invisible), and with no CSS transition there is
 > nothing to overshoot: the easing happens in code.
@@ -727,7 +658,7 @@ sine perturbation `e^(-ζωt)·sin(ω_d·t)` — `ζ = 0.6`, `ω = 30 rad/s` —
 proportional to that icon's own magnification, so the icon under the cursor
 bounces most and distant icons stay put. `spring_strength` is the peak
 overshoot as a fraction of the icon's scale (0.06 = ~6% of the 1.5× max, a
-couple of pixels on a 32 px icon); `spring = false` removes the bounce
+couple of pixels on a 36 px icon); `spring = false` removes the bounce
 entirely and the icons simply stop.
 
 > 🔍 The *rendered* overshoot is slightly smaller than `spring_strength`:

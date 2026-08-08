@@ -62,7 +62,16 @@ pub extern fn gtk_widget_add_css_class(widget: GtkWidget, name: [*:0]const u8) v
 pub extern fn gtk_widget_remove_css_class(widget: GtkWidget, name: [*:0]const u8) void;
 pub extern fn gtk_widget_show(widget: GtkWidget) void;
 pub extern fn gtk_widget_hide(widget: GtkWidget) void;
+pub extern fn gtk_widget_set_visible(widget: GtkWidget, visible: c_int) void;
 pub extern fn gtk_widget_is_visible(widget: GtkWidget) c_int;
+pub extern fn gtk_label_set_ellipsize(label: GtkWidget, mode: c_int) void;
+pub extern fn gtk_image_set_from_icon_name(image: GtkWidget, icon_name: [*:0]const u8) void;
+
+// Pango ellipsize modes
+pub const PANGO_ELLIPSIZE_NONE: c_int = 0;
+pub const PANGO_ELLIPSIZE_START: c_int = 1;
+pub const PANGO_ELLIPSIZE_MIDDLE: c_int = 2;
+pub const PANGO_ELLIPSIZE_END: c_int = 3;
 pub extern fn gtk_widget_get_realized(widget: GtkWidget) c_int;
 pub extern fn gtk_widget_set_tooltip_text(widget: GtkWidget, text: [*:0]const u8) void;
 pub extern fn gtk_widget_set_size_request(widget: GtkWidget, width: c_int, height: c_int) void;
@@ -200,6 +209,7 @@ pub extern fn gtk_box_set_spacing(box: GtkWidget, spacing: c_int) void;
 
 pub extern fn gtk_button_new() GtkWidget;
 pub extern fn gtk_button_new_with_label(label: [*:0]const u8) GtkWidget;
+pub extern fn gtk_button_new_from_icon_name(icon_name: [*:0]const u8) GtkWidget;
 pub extern fn gtk_button_set_child(button: GtkWidget, child: GtkWidget) void;
 
 pub extern fn gtk_label_new(str: [*:0]const u8) GtkWidget;
@@ -207,6 +217,7 @@ pub extern fn gtk_separator_new(orientation: GtkOrientation) GtkWidget;
 
 pub extern fn gtk_image_new() GtkWidget;
 pub extern fn gtk_image_new_from_file(filename: [*:0]const u8) GtkWidget;
+pub extern fn gtk_image_set_from_file(image: GtkWidget, filename: [*:0]const u8) void;
 pub extern fn gtk_image_new_from_paintable(paintable: ?*anyopaque) GtkWidget;
 pub extern fn gtk_image_set_pixel_size(image: GtkWidget, size: c_int) void;
 
@@ -258,8 +269,25 @@ pub extern fn gtk_drop_down_new_from_strings(strings: [*:null]const ?[*:0]const 
 pub extern fn gtk_drop_down_set_selected(drop: GtkWidget, position: c_uint) void;
 pub extern fn gtk_drop_down_get_selected(drop: GtkWidget) c_uint;
 
+// GObject type introspection: GTK 4.14+ REMOVED gtk_drop_down_get_popover
+// (verified absent from the 4.22 headers, lib and GIR). The popover is still
+// a direct child of the dropdown widget (GtkToggleButton -> GtkPopover —
+// verified empirically on 4.22), so we walk the children and identify the
+// popover by its GType. G_OBJECT_TYPE(instance) reads instance->g_class->
+// g_type (the two leading pointers of any GObject instance).
+pub const GTypeClass = extern struct {
+    g_type: usize = 0,
+};
+pub const GTypeInstance = extern struct {
+    g_class: ?*GTypeClass = null,
+};
+pub extern fn gtk_popover_get_type() usize;
+pub extern fn g_type_is_a(type_: usize, is_a_type: usize) c_int;
+
 pub extern fn gtk_header_bar_new() GtkWidget;
+pub extern fn gtk_header_bar_pack_start(bar: GtkWidget, child: GtkWidget) void;
 pub extern fn gtk_header_bar_pack_end(bar: GtkWidget, child: GtkWidget) void;
+pub extern fn gtk_button_set_label(button: GtkWidget, label: [*:0]const u8) void;
 // GTK4 header bars have no set_title/set_subtitle — the title area is a
 // plain widget (dockh-config stacks a title + path label in a GtkBox).
 pub extern fn gtk_header_bar_set_title_widget(bar: GtkWidget, child: GtkWidget) void;
@@ -680,6 +708,23 @@ pub extern fn getuid() c_uint;
 pub extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 pub extern fn clock_gettime(clock_id: c_int, tp: *Timespec) c_int;
 pub extern fn time(tloc: ?*i64) i64;
+
+pub const Tm = extern struct {
+    tm_sec: c_int = 0,
+    tm_min: c_int = 0,
+    tm_hour: c_int = 0,
+    tm_mday: c_int = 0,
+    tm_mon: c_int = 0,
+    tm_year: c_int = 0,
+    tm_wday: c_int = 0,
+    tm_yday: c_int = 0,
+    tm_isdst: c_int = 0,
+    tm_gmtoff: c_long = 0,
+    tm_zone: ?[*:0]const u8 = null,
+};
+
+pub extern fn localtime_r(timep: *const i64, result: *Tm) ?*Tm;
+pub extern fn strftime(s: [*]u8, max: usize, format: [*:0]const u8, tm: *const Tm) usize;
 pub extern fn posix_spawnp(pid: *c_int, file: [*:0]const u8, file_actions: ?*const anyopaque, attrp: ?*const anyopaque, argv: [*]const ?[*:0]u8, envp: [*]const ?[*:0]u8) c_int;
 pub extern fn strerror(errnum: c_int) [*:0]const u8;
 pub extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
