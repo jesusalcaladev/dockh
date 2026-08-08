@@ -20,6 +20,7 @@
 //! setBattery / deinit).
 const std = @import("std");
 const c = @import("c");
+const fs = @import("fs");
 const state = @import("../core/state.zig");
 const log = @import("../core/log.zig");
 
@@ -241,6 +242,65 @@ fn loadCss() void {
 }
 
 // ---------------------------------------------------------------------------
+// Custom SVG icons
+//
+// Every island icon can be overridden with a user SVG placed at
+//   $XDG_CONFIG_HOME/dockh/icons/<name>.svg   (e.g. ~/.config/dockh/icons/)
+// When the file exists it is loaded from disk (GTK4 renders SVG natively);
+// otherwise the island falls back to the named icon from the theme. Keep the
+// SVGs monochrome (white fill) for the controls/OSD to match the dark pill.
+// ---------------------------------------------------------------------------
+
+fn envVal(name: [*:0]const u8) ?[]const u8 {
+    const v = c.getenv(name) orelse return null;
+    return std.mem.span(v);
+}
+
+/// Directory where user SVGs live: $XDG_CONFIG_HOME/dockh/icons (default
+/// ~/.config/dockh/icons). Always valid (falls back to /tmp on OOM).
+fn iconsDir() []const u8 {
+    if (envVal("XDG_CONFIG_HOME")) |d| {
+        return std.fmt.allocPrint(state.alloc, "{s}/dockh/icons", .{d}) catch "/tmp/dockh-icons";
+    }
+    const home = envVal("HOME") orelse "/";
+    return std.fmt.allocPrint(state.alloc, "{s}/.config/dockh/icons", .{home}) catch "/tmp/dockh-icons";
+}
+
+/// Resolve `name.svg` inside the icons dir; null when the file doesn't exist.
+fn svgPath(name: []const u8) ?[]const u8 {
+    const p = std.fmt.allocPrint(state.alloc, "{s}/{s}.svg", .{ iconsDir(), name }) catch return null;
+    if (fs.pathExists(p)) return p;
+    return null;
+}
+
+/// Set an image from a custom SVG when present, else from the theme icon
+/// name. `px` is the rendered pixel size (SVG viewBox is scaled to fit).
+fn setImageIcon(img: ?*anyopaque, svg_name: []const u8, fallback_icon: []const u8, px: c_int) void {
+    if (img == null) return;
+    if (svgPath(svg_name)) |path| {
+        const z = state.alloc.dupeZ(u8, path) catch "";
+        if (z.len > 0) {
+            c.gtk_image_set_from_file(img, z.ptr);
+            c.gtk_image_set_pixel_size(img, px);
+            return;
+        }
+    }
+    const z = state.alloc.dupeZ(u8, fallback_icon) catch return;
+    c.gtk_image_set_from_icon_name(img, z.ptr);
+    c.gtk_image_set_pixel_size(img, px);
+}
+
+/// Build a button whose child image prefers the custom SVG.
+fn makeIconButton(svg_name: []const u8, fallback_icon: []const u8, px: c_int) ?*anyopaque {
+    const btn = c.gtk_button_new();
+    const img = c.gtk_image_new();
+    c.gtk_widget_set_size_request(img, px, px);
+    setImageIcon(img, svg_name, fallback_icon, px);
+    c.gtk_button_set_child(btn, img);
+    return btn;
+}
+
+// ---------------------------------------------------------------------------
 // Monitor helpers (mirror main.zig's: owned reference, unref after use)
 // ---------------------------------------------------------------------------
 
@@ -330,9 +390,9 @@ fn createMusicSection() ?*anyopaque {
     c.gtk_widget_set_size_request(art_wrap, 56, 56);
     art_image = c.gtk_image_new();
     c.gtk_widget_set_size_request(art_image, 56, 56);
-    // placeholder: a music-note icon until real art arrives
-    c.gtk_image_set_from_icon_name(art_image, "audio-x-generic-symbolic");
-    c.gtk_image_set_pixel_size(art_image, 24);
+    // placeholder: a music-note icon until real art arrives (custom SVG or
+    // theme fallback)
+    setImageIcon(art_image, "island-album-placeholder", "audio-x-generic-symbolic", 24);
     c.gtk_box_append(art_wrap, art_image);
     c.gtk_box_append(row, art_wrap);
 
@@ -359,16 +419,16 @@ fn createMusicSection() ?*anyopaque {
     c.gtk_widget_set_name(controls, "island-music-controls");
     c.gtk_widget_set_halign(controls, c.ALIGN_START);
 
-    music_prev_btn = c.gtk_button_new_from_icon_name("media-skip-backward-symbolic");
+    music_prev_btn = makeIconButton("island-prev", "media-skip-backward-symbolic", 18);
     _ = c.g_signal_connect(music_prev_btn, "clicked", @ptrCast(&onPrevClicked), null);
     c.gtk_box_append(controls, music_prev_btn);
 
-    music_play_btn = c.gtk_button_new_from_icon_name("media-playback-start-symbolic");
+    music_play_btn = makeIconButton("island-play", "media-playback-start-symbolic", 22);
     c.gtk_widget_set_name(music_play_btn, "island-play-btn");
     _ = c.g_signal_connect(music_play_btn, "clicked", @ptrCast(&onPlayClicked), null);
     c.gtk_box_append(controls, music_play_btn);
 
-    music_next_btn = c.gtk_button_new_from_icon_name("media-skip-forward-symbolic");
+    music_next_btn = makeIconButton("island-next", "media-skip-forward-symbolic", 18);
     _ = c.g_signal_connect(music_next_btn, "clicked", @ptrCast(&onNextClicked), null);
     c.gtk_box_append(controls, music_next_btn);
 
@@ -400,8 +460,7 @@ fn createNotifSection() ?*anyopaque {
     notif_icon = c.gtk_image_new();
     c.gtk_widget_set_name(notif_icon, "island-notif-icon");
     c.gtk_widget_set_size_request(notif_icon, 40, 40);
-    c.gtk_image_set_from_icon_name(notif_icon, "dialog-information-symbolic");
-    c.gtk_image_set_pixel_size(notif_icon, 22);
+    setImageIcon(notif_icon, "island-notif", "dialog-information-symbolic", 22);
     c.gtk_box_append(box, notif_icon);
 
     const text_box = c.gtk_box_new(c.ORIENTATION_VERTICAL, 2);
@@ -447,8 +506,7 @@ fn createOsdSection() ?*anyopaque {
     c.gtk_widget_set_halign(box, c.ALIGN_CENTER);
 
     osd_icon = c.gtk_image_new();
-    c.gtk_image_set_from_icon_name(osd_icon, "audio-volume-high-symbolic");
-    c.gtk_image_set_pixel_size(osd_icon, 30);
+    setImageIcon(osd_icon, "island-volume-high", "audio-volume-high-symbolic", 30);
     c.gtk_box_append(box, osd_icon);
 
     const right = c.gtk_box_new(c.ORIENTATION_VERTICAL, 0);
@@ -679,8 +737,7 @@ fn setAlbumArt(path: []const u8) bool {
     }
     // Empty or non-file: reset to the placeholder.
     last_art_path = "";
-    c.gtk_image_set_from_icon_name(art_image, "audio-x-generic-symbolic");
-    c.gtk_image_set_pixel_size(art_image, 24);
+    setImageIcon(art_image, "island-album-placeholder", "audio-x-generic-symbolic", 24);
     return true;
 }
 
@@ -718,9 +775,11 @@ pub fn updateMusic(title: []const u8, artist: []const u8, status: []const u8, al
         if (music_play_btn) |btn| {
             const child = c.gtk_widget_get_first_child(btn);
             if (child) |img| {
-                const icon = if (playing) "media-playback-pause-symbolic" else "media-playback-start-symbolic";
-                const z = state.alloc.dupeZ(u8, icon) catch return;
-                c.gtk_image_set_from_icon_name(img, z.ptr);
+                if (playing) {
+                    setImageIcon(img, "island-pause", "media-playback-pause-symbolic", 22);
+                } else {
+                    setImageIcon(img, "island-play", "media-playback-start-symbolic", 22);
+                }
             }
         }
     }
@@ -768,15 +827,19 @@ pub fn showNotification(app: []const u8, icon: []const u8, title_text: []const u
         c.gtk_label_set_text(lbl, z.ptr);
     }
 
-    // Icon by name, falling back to a generic bell.
+    // Icon: prefer a custom SVG for the well-known slots (battery warning),
+    // else use the app icon by name; a generic bell is the last resort.
     if (notif_icon) |img| {
         if (icon.len > 0) {
-            const z = state.alloc.dupeZ(u8, icon) catch "";
-            if (z.len > 0) c.gtk_image_set_from_icon_name(img, z.ptr);
-            c.gtk_image_set_pixel_size(img, 22);
+            if (std.mem.eql(u8, icon, "battery-low-symbolic")) {
+                setImageIcon(img, "island-battery-low", icon, 22);
+            } else {
+                const z = state.alloc.dupeZ(u8, icon) catch "";
+                if (z.len > 0) c.gtk_image_set_from_icon_name(img, z.ptr);
+                c.gtk_image_set_pixel_size(img, 22);
+            }
         } else {
-            c.gtk_image_set_from_icon_name(img, "dialog-information-symbolic");
-            c.gtk_image_set_pixel_size(img, 22);
+            setImageIcon(img, "island-notif", "dialog-information-symbolic", 22);
         }
     }
 
@@ -792,9 +855,17 @@ pub fn showOsd(icon: []const u8, title_text: []const u8, fraction: f64) void {
     if (island_win == null) createIslandWindow();
 
     if (osd_icon) |img| {
-        const z = state.alloc.dupeZ(u8, icon) catch return;
-        c.gtk_image_set_from_icon_name(img, z.ptr);
-        c.gtk_image_set_pixel_size(img, 30);
+        // OSD icons: volume (muted/low/high) and brightness each have a custom
+        // SVG slot, with the theme icon as fallback.
+        const svg_name: []const u8 = if (std.mem.indexOf(u8, icon, "muted") != null)
+            "island-volume-muted"
+        else if (std.mem.indexOf(u8, icon, "low") != null)
+            "island-volume-low"
+        else if (std.mem.indexOf(u8, icon, "brightness") != null)
+            "island-brightness"
+        else
+            "island-volume-high";
+        setImageIcon(img, svg_name, icon, 30);
     }
     if (osd_title_label) |lbl| {
         const z = state.alloc.dupeZ(u8, title_text) catch return;
@@ -846,6 +917,8 @@ pub fn setBattery(pct: i32, charging: bool, present: bool) void {
     // One-shot low-battery warning when crossing 20% while discharging.
     if (pct <= 20 and !charging and !battery_warned) {
         battery_warned = true;
+        // "battery-low-symbolic" maps to the island-battery-low.svg slot inside
+        // showNotification; falls back to the theme icon when no SVG exists.
         showNotification("battery", "battery-low-symbolic", "Battery low", std.fmt.allocPrint(state.alloc, "{d}% remaining — plug in soon.", .{pct}) catch "");
     } else if (pct > 25 or charging) {
         battery_warned = false;
