@@ -337,20 +337,16 @@ fn getLabel(label_key: []const u8) []const u8 {
     return sec;
 }
 
+// Curated option list — kept deliberately short. Power users can edit the
+// TOML directly; the GUI only exposes the settings people actually touch.
 const fields = [_]Field{
     // ---- General ----
     .{ .tab = .general, .section = "dock", .key = "position", .label_key = "position", .kind = .en_opt, .options = &.{ "bottom", "top", "left", "right" } },
     .{ .tab = .general, .section = "dock", .key = "alignment", .label_key = "alignment", .kind = .en_opt, .options = &.{ "center", "start", "end" } },
     .{ .tab = .general, .section = "dock", .key = "full", .label_key = "full", .kind = .boolean },
-    .{ .tab = .general, .section = "dock", .key = "layer", .label_key = "layer", .kind = .en_opt, .options = &.{ "bottom", "top", "overlay" } },
-    .{ .tab = .general, .section = "dock", .key = "exclusive", .label_key = "exclusive", .kind = .boolean },
     .{ .tab = .general, .section = "dock", .key = "icon_size", .label_key = "icon_size", .kind = .integer, .min = 16, .max = 128, .step = 2 },
     .{ .tab = .general, .section = "dock", .key = "num_workspaces", .label_key = "workspaces", .kind = .integer, .min = 1, .max = 20, .step = 1 },
     .{ .tab = .general, .section = "dock", .key = "target_output", .label_key = "target_output", .kind = .string },
-    .{ .tab = .general, .section = "margins", .key = "top", .label_key = "margin_top", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    .{ .tab = .general, .section = "margins", .key = "bottom", .label_key = "margin_bottom", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    .{ .tab = .general, .section = "margins", .key = "left", .label_key = "margin_left", .kind = .integer, .min = 0, .max = 500, .step = 1 },
-    .{ .tab = .general, .section = "margins", .key = "right", .label_key = "margin_right", .kind = .integer, .min = 0, .max = 500, .step = 1 },
     .{ .tab = .general, .section = "launcher", .key = "show", .label_key = "show_launcher", .kind = .boolean },
     .{ .tab = .general, .section = "launcher", .key = "command", .label_key = "launcher_cmd", .kind = .string },
 
@@ -358,20 +354,16 @@ const fields = [_]Field{
     .{ .tab = .behavior, .section = "dock", .key = "autohide", .label_key = "autohide", .kind = .boolean },
     .{ .tab = .behavior, .section = "dock", .key = "hide_on_activity", .label_key = "intelli_hide", .kind = .boolean },
     .{ .tab = .behavior, .section = "dock", .key = "resident", .label_key = "resident", .kind = .boolean },
-    .{ .tab = .behavior, .section = "hotspot", .key = "delay_ms", .label_key = "hotspot_delay", .kind = .integer, .min = 0, .max = 2000, .step = 5 },
     .{ .tab = .behavior, .section = "animation", .key = "scale", .label_key = "magnify_scale", .kind = .float, .min = 1.0, .max = 3.0, .step = 0.05, .digits = 2 },
-    .{ .tab = .behavior, .section = "animation", .key = "duration_ms", .label_key = "transition", .kind = .integer, .min = 50, .max = 2000, .step = 10 },
 
     // ---- Widgets ----
     .{ .tab = .widgets, .section = "magnify", .key = "enabled", .label_key = "magnify_enabled", .kind = .boolean },
     .{ .tab = .widgets, .section = "magnify", .key = "spread", .label_key = "spread", .kind = .integer, .min = 1, .max = 12, .step = 1 },
-    .{ .tab = .widgets, .section = "magnify", .key = "spring", .label_key = "spring", .kind = .boolean },
     .{ .tab = .widgets, .section = "island", .key = "enabled", .label_key = "island", .kind = .boolean },
     .{ .tab = .widgets, .section = "progress", .key = "enabled", .label_key = "progress", .kind = .boolean },
     .{ .tab = .widgets, .section = "badge", .key = "enabled", .label_key = "badge", .kind = .boolean },
 
     // ---- Apps ----
-    .{ .tab = .apps, .section = "apps", .key = "css_file", .label_key = "css_file", .kind = .string },
     .{ .tab = .apps, .section = "apps", .key = "pinned", .label_key = "pinned", .kind = .list },
     .{ .tab = .apps, .section = "apps", .key = "ignore_classes", .label_key = "ignore_classes", .kind = .list },
     .{ .tab = .apps, .section = "apps", .key = "ignore_workspaces", .label_key = "ignore_ws", .kind = .list },
