@@ -563,6 +563,8 @@ pub fn g_signal_connect(instance: ?*anyopaque, detailed_signal: [*:0]const u8, c
 }
 pub extern fn g_object_ref(object: ?*anyopaque) ?*anyopaque;
 pub extern fn g_object_unref(object: ?*anyopaque) void;
+// GError (declared above with the CSS bindings) — g_error_get_message is an
+// inline function (no symbol), so read the `message` field directly.
 pub extern fn g_error_free(err_obj: ?*anyopaque) void;
 pub extern fn gtk_widget_set_opacity(widget: ?*anyopaque, opacity: f64) void;
 pub extern fn g_timeout_add(interval: c_uint, function: ?*const anyopaque, data: ?*anyopaque) c_uint;

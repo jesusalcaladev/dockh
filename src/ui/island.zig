@@ -75,7 +75,10 @@ var last_shot_path: []const u8 = "";
 // the polled (scratch) strings never read freed memory).
 var last_title: []const u8 = "";
 var last_artist: []const u8 = "";
-var last_art_path: []const u8 = "";
+var last_art_path: []const u8 = ""; // art source currently handled (file:// path or http URL)
+var last_art_file: []const u8 = ""; // cache file actually displayed (avoids re-decoding every poll)
+var last_art_attempt: i64 = 0; // unix seconds of the last download attempt (retry backoff)
+var art_dir_ready = false;
 var last_playing = false;
 var was_playing = false;
 var notif_timer: c_uint = 0;
@@ -770,8 +773,7 @@ fn onNextClicked(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
 
 /// Run a shell command for a screenshot action: wl-copy feeds the file on
 /// stdin, xdg-open takes the path as an argument. The path is embedded in
-/// single quotes with POSIX escaping (' -> '\''), so a quote anywhere in
-/// HOME/XDG dirs can't break or inject into the command.
+/// single quotes with POSIX escaping (via appendShellQuoted).
 fn shotShellCmd(comptime prefix: []const u8) void {
     if (last_shot_path.len == 0) return;
     var buf: [2048]u8 = undefined;
@@ -779,22 +781,8 @@ fn shotShellCmd(comptime prefix: []const u8) void {
     if (prefix.len >= buf.len) return;
     @memcpy(buf[0..prefix.len], prefix);
     pos += prefix.len;
-    buf[pos] = '\'';
-    pos += 1;
-    for (last_shot_path) |ch| {
-        if (ch == '\'') {
-            const esc = "'\\''";
-            if (pos + esc.len >= buf.len) return;
-            @memcpy(buf[pos .. pos + esc.len], esc);
-            pos += esc.len;
-        } else {
-            if (pos + 1 >= buf.len) return;
-            buf[pos] = ch;
-            pos += 1;
-        }
-    }
-    buf[pos] = '\'';
-    pos += 1;
+    if (!appendShellQuoted(&buf, &pos, last_shot_path)) return;
+    if (pos >= buf.len) return;
     buf[pos] = 0;
     spawnArgv(&.{ "sh", "-c", buf[0..pos :0] });
 }
@@ -808,7 +796,11 @@ fn onShotOpen(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
 }
 
 fn spawnArgv(argv: []const []const u8) void {
-    const launcher = c.g_subprocess_launcher_new(c.G_SPAWN_SEARCH_PATH);
+    // STDERR_SILENCE keeps command noise (curl progress, playerctl warnings)
+    // out of the log. NO STDOUT_PIPE: this is a fire-and-forget spawn whose
+    // GSubprocess is unref'd immediately — a stdout pipe would be closed on
+    // finalize and (for a live child) risks SIGPIPE killing the download.
+    const launcher = c.g_subprocess_launcher_new(c.G_SUBPROCESS_FLAGS_STDERR_SILENCE);
     if (launcher == null) return;
     defer c.g_object_unref(launcher);
 
@@ -825,6 +817,8 @@ fn spawnArgv(argv: []const []const u8) void {
     if (sub) |s| {
         c.g_object_unref(s);
     } else if (err) |e| {
+        const ge: *const c.GError = @ptrCast(@alignCast(e));
+        log.info("island: spawn failed: {s}", .{std.mem.span(ge.message)});
         c.g_error_free(e);
     }
 }
@@ -841,11 +835,126 @@ pub fn setup() void {
     log.debug("island: always-visible pill up (clock + battery + music/notif/osd)", .{});
 }
 
-/// Load album art from a `file://` path (playerctl mpris:artUrl). Non-file
-/// URLs (http) are skipped — the placeholder stays. Returns true when the
-/// image changed.
+/// Cache directory for downloaded album art: $XDG_CACHE_HOME/dockh (default
+/// ~/.cache/dockh).
+fn artCacheDir() []const u8 {
+    if (envVal("XDG_CACHE_HOME")) |d| {
+        return std.fmt.allocPrint(state.alloc, "{s}/dockh", .{d}) catch "/tmp";
+    }
+    const home = envVal("HOME") orelse "/";
+    return std.fmt.allocPrint(state.alloc, "{s}/.cache/dockh", .{home}) catch "/tmp";
+}
+
+/// Deterministic cache path for a remote art URL: art-<wyhash-hex>. gdk-pixbuf
+/// sniffs image content, so the extensionless file loads fine whatever the
+/// format (png/jpeg/webp). Ensures the cache dir exists.
+fn artCachePath(url: []const u8) ?[]const u8 {
+    const dir = artCacheDir();
+    if (!art_dir_ready) art_dir_ready = fs.ensureDir(dir); // mkdir once, not every poll
+    var h = std.hash.Wyhash.init(0x5eed);
+    h.update(url);
+    const digest = h.final();
+    return std.fmt.allocPrint(state.alloc, "{s}/art-{x:0>16}", .{ dir, digest }) catch null;
+}
+
+/// Download `url` into the cache with a DETACHED curl: the 1s status poll
+/// picks the file up when it lands, so the download never blocks the GTK
+/// main loop. curl writes to `<cache>.tmp` and only renames it to the final
+/// path on success (mv && rm-f on failure), so the cache never holds a
+/// partial download. Note: unref'ing the live GSubprocess drops glib's child
+/// watch — the short-lived curl becomes a zombie until dockh exits (init
+/// reaps it); harmless.
+fn spawnArtDownload(url: []const u8, cache: []const u8) void {
+    const tmp = std.fmt.allocPrint(state.alloc, "{s}.tmp", .{cache}) catch return;
+    var cmd: [4096]u8 = undefined;
+    var pos: usize = 0;
+    const pre = "curl -sSL --fail --max-time 8 -o ";
+    if (pre.len >= cmd.len) return;
+    @memcpy(cmd[0..pre.len], pre);
+    pos += pre.len;
+    if (!appendShellQuoted(&cmd, &pos, tmp)) return;
+    const sp = " ";
+    if (pos + sp.len >= cmd.len) return;
+    @memcpy(cmd[pos .. pos + sp.len], sp);
+    pos += sp.len;
+    if (!appendShellQuoted(&cmd, &pos, url)) return;
+    const mv = " && mv ";
+    if (pos + mv.len >= cmd.len) return;
+    @memcpy(cmd[pos .. pos + mv.len], mv);
+    pos += mv.len;
+    if (!appendShellQuoted(&cmd, &pos, tmp)) return; // mv SOURCE (the .tmp)
+    const mv_sp = " ";
+    if (pos + mv_sp.len >= cmd.len) return;
+    @memcpy(cmd[pos .. pos + mv_sp.len], mv_sp);
+    pos += mv_sp.len;
+    if (!appendShellQuoted(&cmd, &pos, cache)) return; // mv DESTINATION
+    const rm = " || rm -f ";
+    if (pos + rm.len >= cmd.len) return;
+    @memcpy(cmd[pos .. pos + rm.len], rm);
+    pos += rm.len;
+    if (!appendShellQuoted(&cmd, &pos, tmp)) return;
+    if (pos >= cmd.len) return;
+    cmd[pos] = 0;
+    spawnArgv(&.{ "sh", "-c", cmd[0..pos :0] });
+}
+
+/// Show the cached art unless it's already displayed (the 1s poll calls this
+/// every tick — the `last_art_file` guard stops GTK from re-decoding the
+/// image 60×/min). Ignores a missing or empty cache file.
+fn loadArtCache(cache: []const u8) bool {
+    if (std.mem.eql(u8, last_art_file, cache)) return true; // already shown
+    if (!fs.pathExists(cache)) return false;
+    if (!fileNonEmpty(cache)) return false;
+    last_art_file = state.alloc.dupe(u8, cache) catch return false;
+    log.info("island: album art loaded ({s})", .{cache});
+    const z = state.alloc.dupeZ(u8, cache) catch return false;
+    c.gtk_image_set_from_file(art_image, z.ptr);
+    c.gtk_image_set_pixel_size(art_image, 56);
+    return true;
+}
+
+/// Handle an http(s) mpris:artUrl: serve it from the cache when downloaded,
+/// otherwise kick off a background download (the placeholder stays until the
+/// 1s poll sees the cached file land). A failed download retries every 30s,
+/// so a transient network blip (or a dead URL that comes back later)
+/// recovers without a dockh restart.
+fn setRemoteArt(url: []const u8) bool {
+    const cache = artCachePath(url) orelse return false;
+    var now: i64 = 0;
+    _ = c.time(&now);
+
+    if (!std.mem.eql(u8, last_art_path, url)) {
+        // First sight of this URL: serve from cache or start a download.
+        last_art_path = state.alloc.dupe(u8, url) catch return false;
+        last_art_file = "";
+        last_art_attempt = 0;
+        if (loadArtCache(cache)) return true;
+        last_art_attempt = now;
+        log.info("island: downloading album art into {s}", .{cache});
+        spawnArtDownload(url, cache);
+        return false;
+    }
+
+    // Same URL: show the art once the download lands; otherwise retry a
+    // failed download after a 30s backoff.
+    if (loadArtCache(cache)) return true;
+    if (now - last_art_attempt >= 30) {
+        last_art_attempt = now;
+        log.info("island: retrying album art download into {s}", .{cache});
+        spawnArtDownload(url, cache);
+    }
+    return false;
+}
+
+/// Load album art for the music view. Handles file:// paths (playerctl) and
+/// http(s) URLs (downloaded + cached under ~/.cache/dockh). Returns true when
+/// the image changed.
 fn setAlbumArt(path: []const u8) bool {
     if (art_image == null) return false;
+    // Remote art: async download + cache (dedups on the URL itself).
+    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {
+        return setRemoteArt(path);
+    }
     if (std.mem.eql(u8, last_art_path, path)) return false;
     if (std.mem.startsWith(u8, path, "file://")) {
         const p = path["file://".len..];
@@ -1025,6 +1134,31 @@ fn isImagePath(s: []const u8) bool {
 /// two detection paths (screenshot-file poll + mako app-icon path) race
 /// safely — the second call for the same file is a no-op. Auto-dismisses
 /// after 6s back to music (if playing) or the idle pill.
+/// Append `s` to `buf` at `*pos`, wrapped in single quotes with POSIX
+/// escaping (' -> '\'') so a quote anywhere in the value can't break or
+/// inject into a sh -c command. Returns false when it doesn't fit.
+fn appendShellQuoted(buf: []u8, pos: *usize, s: []const u8) bool {
+    if (pos.* + 1 >= buf.len) return false;
+    buf[pos.*] = '\'';
+    pos.* += 1;
+    for (s) |ch| {
+        if (ch == '\'') {
+            const esc = "'\\''";
+            if (pos.* + esc.len >= buf.len) return false;
+            @memcpy(buf[pos.* .. pos.* + esc.len], esc);
+            pos.* += esc.len;
+        } else {
+            if (pos.* + 1 >= buf.len) return false;
+            buf[pos.*] = ch;
+            pos.* += 1;
+        }
+    }
+    if (pos.* + 1 >= buf.len) return false;
+    buf[pos.*] = '\'';
+    pos.* += 1;
+    return true;
+}
+
 /// True when `path` exists and already has content (grim may still be
 /// writing the file when the mako notification lands — refuse to render a
 /// partial PNG; the file poll retries a second later).
