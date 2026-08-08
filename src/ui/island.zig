@@ -138,7 +138,6 @@ const island_css =
     \\
     \\#island-art-wrap {
     \\    border-radius: 12px;
-    \\    overflow: hidden;
     \\    background-color: rgba(255, 255, 255, 0.08);
     \\    border: 1px solid rgba(255, 255, 255, 0.08);
     \\    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
@@ -168,11 +167,11 @@ const island_css =
     \\#island-music-controls button:hover {
     \\    background-color: rgba(255, 255, 255, 0.12);
     \\}
-    \\#island-play-btn {
-    \\    background-color: rgba(255, 255, 255, 0.15) !important;
+    \\#island-music-controls #island-play-btn {
+    \\    background-color: rgba(255, 255, 255, 0.15);
     \\}
-    \\#island-play-btn:hover {
-    \\    background-color: rgba(255, 255, 255, 0.24) !important;
+    \\#island-music-controls #island-play-btn:hover {
+    \\    background-color: rgba(255, 255, 255, 0.24);
     \\}
     \\
     \\#island-progress {
@@ -813,6 +812,7 @@ pub fn updateMusicProgress(fraction: f64) void {
 pub fn showNotification(app: []const u8, icon: []const u8, title_text: []const u8, body: []const u8) void {
     if (!state.cfg.island_enabled) return;
     if (island_win == null) createIslandWindow();
+    log.info("island: notification from {s}: {s}", .{ app, title_text });
 
     if (notif_app_label) |lbl| {
         const z = state.alloc.dupeZ(u8, app) catch return;

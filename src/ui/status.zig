@@ -16,7 +16,10 @@ const log = @import("../core/log.zig");
 /// Run `argv` and return its stdout (allocated in `alloc`), or null on any
 /// failure. stdout/stderr from GSubprocess are g_malloc'd — always g_free'd.
 fn runCapture(alloc: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
-    const launcher = c.g_subprocess_launcher_new(c.G_SPAWN_SEARCH_PATH);
+    // STDOUT_PIPE lets communicate_utf8 capture the child's stdout; STDERR_SILENCE
+    // stops playerctl's "No player could handle this command" from spamming the
+    // dock's log on every 1s poll when no music is playing.
+    const launcher = c.g_subprocess_launcher_new(c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_SILENCE);
     if (launcher == null) return null;
     defer c.g_object_unref(launcher);
 
@@ -143,36 +146,56 @@ const Notification = struct {
     body: []const u8 = "",
 };
 
+/// Get a string field from a notification object, accepting BOTH the
+/// hyphenated keys newer mako emits ("app-name") and the underscored keys
+/// mako 1.11 emits ("app_name").
+fn jsonField(obj: std.json.ObjectMap, hyph: []const u8, under: []const u8) []const u8 {
+    if (obj.get(hyph)) |v| {
+        if (v == .string) return v.string;
+    }
+    if (obj.get(under)) |v| {
+        if (v == .string) return v.string;
+    }
+    return "";
+}
+
 /// Parse `makoctl list` into a flat list of app identifiers. Accepts both
 /// output formats across mako versions:
-///   * modern: JSON  {"notifications": [{"app-name": "firefox", ...}]}
-///   * legacy: plain text  "Notification 12: Title\n  App name: firefox"
+///   * JSON (preferred — `makoctl list -j`): either a BARE ARRAY of
+///     notification objects (mako 1.11) or an object wrapping a
+///     "notifications" array (newer mako); keys may be "app-name" OR
+///     "app_name". Carries ids, so the island can detect NEW notifications.
+///   * legacy plain text  "Notification 12: Title\n  App name: firefox" —
+///     no ids (island pop-out unavailable), badges only.
 fn parseMakoList(alloc: std.mem.Allocator, data: []const u8) []Notification {
     var out: std.ArrayList(Notification) = .empty;
 
-    if (std.mem.indexOfScalar(u8, data, '{') == 0) {
+    if (std.mem.indexOfScalar(u8, data, '[') == 0 or std.mem.indexOfScalar(u8, data, '{') == 0) {
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch return &.{};
         defer parsed.deinit();
         const root = parsed.value;
-        if (root != .object) return &.{};
-        const notifs = root.object.get("notifications") orelse return &.{};
-        if (notifs != .array) return &.{};
-        for (notifs.array.items) |n| {
+        // Normalize to an array of notification objects (bare array OR
+        // object with a "notifications" array key).
+        var arr: []std.json.Value = undefined;
+        if (root == .array) {
+            arr = root.array.items;
+        } else if (root == .object) {
+            const notifs = root.object.get("notifications") orelse return &.{};
+            if (notifs != .array) return &.{};
+            arr = notifs.array.items;
+        } else {
+            return &.{};
+        }
+        for (arr) |n| {
             if (n != .object) continue;
-            var app: []const u8 = "";
-            var icon: []const u8 = "";
+            var app = jsonField(n.object, "app-name", "app_name");
+            const icon = jsonField(n.object, "app-icon", "app_icon");
             var id: u32 = 0;
             var summary: []const u8 = "";
             var body: []const u8 = "";
-            if (n.object.get("app-name")) |v| {
-                if (v == .string) app = v.string;
-            }
-            if (n.object.get("app-icon")) |v| {
-                if (v == .string) icon = v.string;
-            }
             if (app.len == 0) app = icon; // last-resort app fallback
             if (n.object.get("id")) |v| {
-                if (v == .integer) id = @intCast(v.integer);
+                if (v == .integer and v.integer > 0) id = @intCast(v.integer);
             }
             if (n.object.get("summary")) |v| {
                 if (v == .string) summary = v.string;
@@ -274,7 +297,12 @@ fn isNewNotifId(id: u32) bool {
 /// detect brand-new notifications (by id) to pop out of the Dynamic Island.
 fn pollBadges() void {
     if (!state.cfg.badge_enabled and !state.cfg.island_enabled) return;
-    const data = runCapture(state.scratch, &.{ "makoctl", "list" }) orelse return;
+    // Prefer JSON (`makoctl list -j`) — it carries ids so the island can
+    // detect NEW notifications. Older makoctl rejects the flag, so fall back
+    // to the plain-text format (badges still work; island pop-out is then
+    // unavailable because text output has no ids).
+    const data = (runCapture(state.scratch, &.{ "makoctl", "list", "-j" }) orelse
+        runCapture(state.scratch, &.{ "makoctl", "list" })) orelse return;
     defer state.scratch.free(data);
 
     const notifs = parseMakoList(state.scratch, data);

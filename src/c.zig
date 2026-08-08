@@ -468,8 +468,12 @@ pub extern fn gtk_label_set_text(label: GtkWidget, str: [*:0]const u8) void;
 // GLib spawns with posix_spawn (no fork() in a multithreaded GTK process).
 // ---------------------------------------------------------------------------
 
-// G_SPAWN_SEARCH_PATH = 1 << 2 (glib gspawn.h)
+// G_SPAWN_SEARCH_PATH = 1 << 2 (glib gspawn.h). NOTE: g_subprocess_launcher_new
+// interprets this bit as G_SUBPROCESS_FLAGS_STDOUT_PIPE — the exact flag
+// runCapture needs to read the child's stdout via communicate_utf8.
 pub const G_SPAWN_SEARCH_PATH: c_int = 4;
+pub const G_SUBPROCESS_FLAGS_STDOUT_PIPE: c_int = 1 << 2;
+pub const G_SUBPROCESS_FLAGS_STDERR_SILENCE: c_int = 1 << 5;
 
 pub extern fn g_subprocess_launcher_new(flags: c_int) ?*anyopaque;
 // glib 2.88 made g_subprocess_launcher_spawn variadic (self, error, argv0, ...);
