@@ -8,6 +8,7 @@
 //! rebuilding the dock, so nothing flickers.
 const std = @import("std");
 const c = @import("c"); // named module (build.zig)
+const fs = @import("fs"); // named module (build.zig)
 const state = @import("../core/state.zig");
 const widgets = @import("widgets.zig");
 const island = @import("island.zig");
@@ -274,8 +275,12 @@ fn appMatchesClass(app: []const u8, class: []const u8) bool {
 /// Seen mako notification ids: a small ring so NEW notifications (ids we've
 /// never seen before) pop out of the Dynamic Island exactly once, and the
 /// badge poll doesn't re-fire old ones after a dockh restart or mako restart.
+/// `notif_seeded` marks the first poll: it only RECORDS the ids already in
+/// mako's list (no pop-out), so a dockh restart doesn't re-pop old
+/// notifications — or old screenshots — that are still queued.
 var seen_notif_ids: [64]u32 = [_]u32{0} ** 64;
 var seen_notif_count: usize = 0;
+var notif_seeded = false;
 
 fn isNewNotifId(id: u32) bool {
     if (id == 0) return false;
@@ -311,23 +316,43 @@ fn pollBadges() void {
     // NEW notification -> Dynamic Island pop-out (most recent one wins).
     // Only meaningful from the JSON branch, which carries ids.
     if (state.cfg.island_enabled) {
-        var new_id: u32 = 0;
-        var newest_idx: ?usize = null;
-        for (notifs, 0..) |n, i| {
-            if (n.id != 0 and isNewNotifId(n.id)) {
-                if (newest_idx == null or n.id > new_id) {
-                    new_id = n.id;
-                    newest_idx = i;
+        if (!notif_seeded) {
+            // First poll: record the already-queued ids without popping.
+            notif_seeded = true;
+            for (notifs) |n| {
+                if (n.id != 0) _ = isNewNotifId(n.id);
+            }
+        } else {
+            var new_id: u32 = 0;
+            var newest_idx: ?usize = null;
+            for (notifs, 0..) |n, i| {
+                if (n.id != 0 and isNewNotifId(n.id)) {
+                    if (newest_idx == null or n.id > new_id) {
+                        new_id = n.id;
+                        newest_idx = i;
+                    }
                 }
             }
-        }
-        if (newest_idx) |idx| {
-            const n = notifs[idx];
-            const title = if (n.summary.len > 0) n.summary else n.app;
-            // Pass the real icon id (app-icon) so the island shows the app's
-            // icon instead of trying to resolve the desktop-entry name.
-            const icon_name = if (n.icon.len > 0) n.icon else n.app;
-            island.showNotification(n.app, icon_name, title, n.body);
+            if (newest_idx) |idx| {
+                const n = notifs[idx];
+                const title = if (n.summary.len > 0) n.summary else n.app;
+                // Pass the real icon id (app-icon) so the island shows the app's
+                // icon instead of trying to resolve the desktop-entry name.
+                const icon_name = if (n.icon.len > 0) n.icon else n.app;
+                // When app-icon is a FILE PATH (the omarchy screenshot script
+                // passes the screenshot path), pop the dedicated screenshot
+                // preview (thumbnail + copy/open) instead of the text toast —
+                // showScreenshot dedups against the file-poll path.
+                if (icon_name.len > 0 and
+                    (std.mem.startsWith(u8, icon_name, "/") or
+                        std.mem.startsWith(u8, icon_name, "~/") or
+                        std.mem.startsWith(u8, icon_name, "file://")))
+                {
+                    island.showScreenshot(icon_name);
+                } else {
+                    island.showNotification(n.app, icon_name, title, n.body);
+                }
+            }
         }
     }
 
@@ -459,6 +484,100 @@ fn pollBattery() void {
 fn onBatteryTimer(_: ?*anyopaque) callconv(.c) c_int {
     pollBattery();
     return 1; // keep the timer
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots (macOS-style preview pop-out)
+// ---------------------------------------------------------------------------
+// When a new screenshot lands in the screenshots dir (omarchy's
+// `omarchy capture screenshot` writes screenshot-*.png there, but any tool
+// that writes a screenshot-*.png file works), the island pops out a preview
+// with copy/open actions. Two detection paths race into island.showScreenshot
+// — this 1s scandir, and the mako app-icon-path shortcut in pollBadges — and
+// showScreenshot dedups by path, so only one pop-out happens per screenshot.
+
+var shot_seeded = false;
+var last_shot_name: []const u8 = ""; // owned copy in the permanent state.alloc
+
+fn envValue(name: [*:0]const u8) ?[]const u8 {
+    const v = c.getenv(name) orelse return null;
+    const s = std.mem.span(v);
+    if (s.len == 0) return null;
+    return s;
+}
+
+/// Make a config-supplied directory absolute: resolve $HOME/~/ prefixes and
+/// plain relative values against `home`. Returns an owned copy in `alloc`.
+fn absDir(alloc: std.mem.Allocator, home: []const u8, path: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, path, "$HOME")) {
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ home, path["$HOME".len..] }) catch null;
+    }
+    if (std.mem.startsWith(u8, path, "~")) {
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ home, path[1..] }) catch null;
+    }
+    if (path.len > 0 and path[0] == '/') return alloc.dupe(u8, path) catch null;
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ home, path }) catch null;
+}
+
+/// Resolve the screenshots directory, mirroring omarchy-capture-screenshot:
+/// OMARCHY_SCREENSHOT_DIR, XDG_SCREENSHOTS_DIR, XDG_PICTURES_DIR, then the
+/// XDG_PICTURES_DIR line of ~/.config/user-dirs.dirs, else ~/Pictures.
+fn screenshotsDir(alloc: std.mem.Allocator) ?[]const u8 {
+    const home = envValue("HOME") orelse "/";
+    if (envValue("OMARCHY_SCREENSHOT_DIR")) |d| return absDir(alloc, home, d);
+    if (envValue("XDG_SCREENSHOTS_DIR")) |d| return absDir(alloc, home, d);
+    if (envValue("XDG_PICTURES_DIR")) |d| return absDir(alloc, home, d);
+
+    var path_buf: [512:0]u8 = undefined;
+    const user_dirs = std.fmt.bufPrint(&path_buf, "{s}/.config/user-dirs.dirs", .{home}) catch null;
+    if (user_dirs) |p| {
+        path_buf[p.len] = 0;
+        var fbuf: [4096]u8 = undefined;
+        const fn_ = readFileBuf(path_buf[0..p.len :0].ptr, &fbuf);
+        if (fn_ > 0) {
+            var lines = std.mem.splitScalar(u8, fbuf[0..fn_], '\n');
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (!std.mem.startsWith(u8, line, "XDG_PICTURES_DIR=")) continue;
+                const val = std.mem.trim(u8, line["XDG_PICTURES_DIR=".len..], " \t\"");
+                if (val.len == 0) continue;
+                return absDir(alloc, home, val);
+            }
+        }
+    }
+    return std.fmt.allocPrint(alloc, "{s}/Pictures", .{home}) catch null;
+}
+
+/// Scan the screenshots dir for the newest screenshot-* file. The first poll
+/// after startup only SEEDS the baseline (latest existing screenshot is not
+/// popped — like the volume/brightness baseline); afterwards a new file
+/// triggers the island preview.
+fn pollScreenshots() void {
+    if (!state.cfg.island_enabled) return;
+    const dir_path = screenshotsDir(state.scratch) orelse return;
+    defer state.scratch.free(dir_path);
+
+    // Timestamp names (screenshot-YYYY-MM-DD_HH-MM-SS.png) sort by name =
+    // by time, so the lexicographically greatest name is the newest file.
+    const names = fs.listDirFiles(state.scratch, dir_path) orelse return;
+    defer state.scratch.free(names);
+    var newest_name: ?[]const u8 = null;
+    for (names) |name| {
+        if (!std.mem.startsWith(u8, name, "screenshot-")) continue;
+        if (newest_name == null or std.mem.order(u8, name, newest_name.?) == .gt) {
+            newest_name = name;
+        }
+    }
+    const name = newest_name orelse return;
+    if (std.mem.eql(u8, name, last_shot_name)) return;
+    if (!shot_seeded) {
+        shot_seeded = true;
+        last_shot_name = state.alloc.dupe(u8, name) catch return;
+        return;
+    }
+    last_shot_name = state.alloc.dupe(u8, name) catch return; // permanent arena
+    const full = std.fmt.allocPrint(state.scratch, "{s}/{s}", .{ dir_path, name }) catch return;
+    island.showScreenshot(full);
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +789,7 @@ fn onProgressTimer(_: ?*anyopaque) callconv(.c) c_int {
     // is unchanged, so they're idle-cheap).
     pollVolume();
     pollBrightness();
+    pollScreenshots();
     return 1; // keep the timer
 }
 

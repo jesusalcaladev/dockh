@@ -28,7 +28,7 @@ const log = @import("../core/log.zig");
 // State
 // ---------------------------------------------------------------------------
 
-const Mode = enum { idle, music, notif, osd };
+const Mode = enum { idle, music, notif, osd, screenshot };
 
 var island_win: ?*anyopaque = null;
 var root_box: ?*anyopaque = null;
@@ -62,6 +62,13 @@ var osd_box: ?*anyopaque = null;
 var osd_icon: ?*anyopaque = null;
 var osd_title_label: ?*anyopaque = null;
 var osd_progress: ?*anyopaque = null;
+
+// Screenshot section
+var shot_box: ?*anyopaque = null;
+var shot_image: ?*anyopaque = null;
+var shot_title_label: ?*anyopaque = null;
+var shot_body_label: ?*anyopaque = null;
+var last_shot_path: []const u8 = "";
 
 // State machine — the *_last slices are OWNED copies (state.alloc is a
 // permanent arena, so storing dupes here is safe and the comparisons against
@@ -152,7 +159,7 @@ const island_css =
     \\    font-size: 12px;
     \\}
     \\
-    \\#island-music-controls button {
+    \\#island-music-controls button, #island-shot-controls button {
     \\    background-color: transparent;
     \\    background-image: none;
     \\    border: none;
@@ -164,7 +171,7 @@ const island_css =
     \\    padding: 4px;
     \\    transition: background-color 140ms ease;
     \\}
-    \\#island-music-controls button:hover {
+    \\#island-music-controls button:hover, #island-shot-controls button:hover {
     \\    background-color: rgba(255, 255, 255, 0.12);
     \\}
     \\#island-music-controls #island-play-btn {
@@ -222,6 +229,22 @@ const island_css =
     \\    background-color: #5ac8fa;
     \\    border-radius: 999px;
     \\    min-height: 6px;
+    \\}
+    \\
+    \\#island-shot-image {
+    \\    border-radius: 12px;
+    \\    background-color: rgba(255, 255, 255, 0.06);
+    \\    border: 1px solid rgba(255, 255, 255, 0.10);
+    \\    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+    \\}
+    \\#island-shot-title {
+    \\    color: #ffffff;
+    \\    font-weight: 700;
+    \\    font-size: 13px;
+    \\}
+    \\#island-shot-body {
+    \\    color: rgba(255, 255, 255, 0.55);
+    \\    font-size: 12px;
     \\}
 ;
 
@@ -528,6 +551,60 @@ fn createOsdSection() ?*anyopaque {
     return box;
 }
 
+fn createShotSection() ?*anyopaque {
+    const box = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 12);
+    shot_box = box;
+    c.gtk_widget_set_name(box, "island-shot");
+    c.gtk_widget_set_size_request(box, EXPANDED_W, EXPANDED_H);
+    c.gtk_widget_set_hexpand(box, 1);
+    c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
+
+    // Screenshot thumbnail (rounded via the border-radius clip of GTK4).
+    shot_image = c.gtk_image_new();
+    c.gtk_widget_set_name(shot_image, "island-shot-image");
+    c.gtk_widget_set_size_request(shot_image, 96, 96);
+    setImageIcon(shot_image, "island-screenshot", "camera-photo-symbolic", 28);
+    c.gtk_box_append(box, shot_image);
+
+    // Right column: app label, title (filename), body, actions.
+    const right = c.gtk_box_new(c.ORIENTATION_VERTICAL, 2);
+    c.gtk_widget_set_valign(right, c.ALIGN_CENTER);
+    c.gtk_widget_set_hexpand(right, 1);
+
+    const app_lbl = c.gtk_label_new("Screenshot");
+    c.gtk_widget_set_name(app_lbl, "island-notif-app"); // same blue caps label
+    c.gtk_widget_set_halign(app_lbl, c.ALIGN_START);
+    c.gtk_box_append(right, app_lbl);
+
+    shot_title_label = c.gtk_label_new("");
+    c.gtk_widget_set_name(shot_title_label, "island-shot-title");
+    c.gtk_widget_set_halign(shot_title_label, c.ALIGN_START);
+    c.gtk_label_set_ellipsize(shot_title_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_box_append(right, shot_title_label);
+
+    shot_body_label = c.gtk_label_new("");
+    c.gtk_widget_set_name(shot_body_label, "island-shot-body");
+    c.gtk_widget_set_halign(shot_body_label, c.ALIGN_START);
+    c.gtk_label_set_ellipsize(shot_body_label, c.PANGO_ELLIPSIZE_END);
+    c.gtk_box_append(right, shot_body_label);
+
+    const controls = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 6);
+    c.gtk_widget_set_name(controls, "island-shot-controls");
+    c.gtk_widget_set_halign(controls, c.ALIGN_START);
+
+    const copy_btn = makeIconButton("island-copy", "edit-copy-symbolic", 16);
+    _ = c.g_signal_connect(copy_btn, "clicked", @ptrCast(&onShotCopy), null);
+    c.gtk_box_append(controls, copy_btn);
+
+    const open_btn = makeIconButton("island-open", "document-open-symbolic", 16);
+    _ = c.g_signal_connect(open_btn, "clicked", @ptrCast(&onShotOpen), null);
+    c.gtk_box_append(controls, open_btn);
+
+    c.gtk_box_append(right, controls);
+    c.gtk_box_append(box, right);
+    return box;
+}
+
 /// Build the whole window and all sections. Safe to call once.
 fn createIslandWindow() void {
     if (island_win != null) return;
@@ -565,6 +642,10 @@ fn createIslandWindow() void {
     _ = createOsdSection();
     c.gtk_widget_set_visible(osd_box, 0);
     c.gtk_box_append(root_box, osd_box);
+
+    _ = createShotSection();
+    c.gtk_widget_set_visible(shot_box, 0);
+    c.gtk_box_append(root_box, shot_box);
 
     c.gtk_window_set_child(win, root_box);
 
@@ -610,6 +691,10 @@ fn setMode(new_mode: Mode) void {
     if (osd_box) |b| {
         c.gtk_widget_set_visible(b, if (new_mode == .osd) 1 else 0);
         if (new_mode == .osd) c.gtk_widget_add_css_class(b, show_class.ptr) else c.gtk_widget_remove_css_class(b, show_class.ptr);
+    }
+    if (shot_box) |b| {
+        c.gtk_widget_set_visible(b, if (new_mode == .screenshot) 1 else 0);
+        if (new_mode == .screenshot) c.gtk_widget_add_css_class(b, show_class.ptr) else c.gtk_widget_remove_css_class(b, show_class.ptr);
     }
 
     recenter();
@@ -672,18 +757,57 @@ fn startClock() void {
 // ---------------------------------------------------------------------------
 
 fn onPrevClicked(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    runPlayerctl(&.{"playerctl", "previous"});
+    spawnArgv(&.{"playerctl", "previous"});
 }
 
 fn onPlayClicked(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    runPlayerctl(&.{"playerctl", "play-pause"});
+    spawnArgv(&.{"playerctl", "play-pause"});
 }
 
 fn onNextClicked(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    runPlayerctl(&.{"playerctl", "next"});
+    spawnArgv(&.{"playerctl", "next"});
 }
 
-fn runPlayerctl(argv: []const []const u8) void {
+/// Run a shell command for a screenshot action: wl-copy feeds the file on
+/// stdin, xdg-open takes the path as an argument. The path is embedded in
+/// single quotes with POSIX escaping (' -> '\''), so a quote anywhere in
+/// HOME/XDG dirs can't break or inject into the command.
+fn shotShellCmd(comptime prefix: []const u8) void {
+    if (last_shot_path.len == 0) return;
+    var buf: [2048]u8 = undefined;
+    var pos: usize = 0;
+    if (prefix.len >= buf.len) return;
+    @memcpy(buf[0..prefix.len], prefix);
+    pos += prefix.len;
+    buf[pos] = '\'';
+    pos += 1;
+    for (last_shot_path) |ch| {
+        if (ch == '\'') {
+            const esc = "'\\''";
+            if (pos + esc.len >= buf.len) return;
+            @memcpy(buf[pos .. pos + esc.len], esc);
+            pos += esc.len;
+        } else {
+            if (pos + 1 >= buf.len) return;
+            buf[pos] = ch;
+            pos += 1;
+        }
+    }
+    buf[pos] = '\'';
+    pos += 1;
+    buf[pos] = 0;
+    spawnArgv(&.{ "sh", "-c", buf[0..pos :0] });
+}
+
+fn onShotCopy(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    shotShellCmd("wl-copy < ");
+}
+
+fn onShotOpen(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    shotShellCmd("xdg-open ");
+}
+
+fn spawnArgv(argv: []const []const u8) void {
     const launcher = c.g_subprocess_launcher_new(c.G_SPAWN_SEARCH_PATH);
     if (launcher == null) return;
     defer c.g_object_unref(launcher);
@@ -829,10 +953,17 @@ pub fn showNotification(app: []const u8, icon: []const u8, title_text: []const u
 
     // Icon: prefer a custom SVG for the well-known slots (battery warning),
     // else use the app icon by name; a generic bell is the last resort.
+    // When the icon is a FILE PATH (mako app-icon can carry one, e.g. the
+    // omarchy screenshot script passes the screenshot path) load the image
+    // instead of resolving an icon name.
     if (notif_icon) |img| {
         if (icon.len > 0) {
             if (std.mem.eql(u8, icon, "battery-low-symbolic")) {
                 setImageIcon(img, "island-battery-low", icon, 22);
+            } else if (isImagePath(icon)) {
+                const z = state.alloc.dupeZ(u8, icon) catch "";
+                if (z.len > 0) c.gtk_image_set_from_file(img, z.ptr);
+                c.gtk_image_set_pixel_size(img, 22);
             } else {
                 const z = state.alloc.dupeZ(u8, icon) catch "";
                 if (z.len > 0) c.gtk_image_set_from_icon_name(img, z.ptr);
@@ -879,6 +1010,63 @@ pub fn showOsd(icon: []const u8, title_text: []const u8, fraction: f64) void {
     setMode(.osd);
     cancelNotifTimer();
     notif_timer = c.g_timeout_add(1500, @ptrCast(&onNotifTimeout), null);
+}
+
+/// True when `s` looks like a file path rather than an icon name: an absolute
+/// path, a home-relative path or a file:// URL.
+fn isImagePath(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "/") or
+        std.mem.startsWith(u8, s, "~/") or
+        std.mem.startsWith(u8, s, "file://");
+}
+
+/// Pop the screenshot state out of the island: thumbnail preview of the new
+/// screenshot, the filename, and copy/open actions. Deduped by path so the
+/// two detection paths (screenshot-file poll + mako app-icon path) race
+/// safely — the second call for the same file is a no-op. Auto-dismisses
+/// after 6s back to music (if playing) or the idle pill.
+/// True when `path` exists and already has content (grim may still be
+/// writing the file when the mako notification lands — refuse to render a
+/// partial PNG; the file poll retries a second later).
+fn fileNonEmpty(path: []const u8) bool {
+    const z = state.alloc.dupeZ(u8, path) catch return false;
+    const f = c.fopen(z.ptr, "r") orelse return false;
+    defer _ = c.fclose(f);
+    if (c.fseek(f, 0, c.SEEK_END) != 0) return false;
+    return c.ftell(f) > 0;
+}
+
+pub fn showScreenshot(path: []const u8) void {
+    if (!state.cfg.island_enabled) return;
+    if (island_win == null) createIslandWindow();
+    if (std.mem.eql(u8, last_shot_path, path)) return; // already shown
+    // Refuse to show a file that isn't there yet (grim may still be writing
+    // when the notification lands) — don't mark it shown, so the retry via
+    // the file poll picks it up a second later.
+    if (!fileNonEmpty(path)) return;
+
+    log.info("island: screenshot {s}", .{path});
+    last_shot_path = state.alloc.dupe(u8, path) catch return;
+
+    const base = std.fs.path.basename(path);
+    if (shot_title_label) |lbl| {
+        const z = state.alloc.dupeZ(u8, base) catch return;
+        c.gtk_label_set_text(lbl, z.ptr);
+    }
+    if (shot_body_label) |lbl| {
+        const z = state.alloc.dupeZ(u8, "Saved to clipboard and file") catch return;
+        c.gtk_label_set_text(lbl, z.ptr);
+    }
+    if (shot_image) |img| {
+        const z = state.alloc.dupeZ(u8, path) catch return;
+        c.gtk_image_set_from_file(img, z.ptr);
+        c.gtk_image_set_pixel_size(img, 96);
+    }
+
+    was_playing = mode == .music;
+    setMode(.screenshot);
+    cancelNotifTimer();
+    notif_timer = c.g_timeout_add(6000, @ptrCast(&onNotifTimeout), null);
 }
 
 /// Update the idle battery label and warn once when crossing 20% while
