@@ -34,9 +34,7 @@ var island_win: ?*anyopaque = null;
 var root_box: ?*anyopaque = null;
 var mode: Mode = .idle;
 
-// Idle pill (clock + battery)
-var clock_label: ?*anyopaque = null;
-var battery_label: ?*anyopaque = null;
+// Idle pill — empty black capsule, like the macOS notch
 var idle_box: ?*anyopaque = null;
 
 // Music section
@@ -92,7 +90,6 @@ var art_dir_ready = false;
 var last_playing = false;
 var was_playing = false;
 var notif_timer: c_uint = 0;
-var clock_timer: c_uint = 0;
 var battery_warned = false;
 var last_battery_pct: i32 = -1;
 var last_battery_charging = false;
@@ -101,8 +98,8 @@ var last_battery_charging = false;
 // Sizing (logical px)
 // ---------------------------------------------------------------------------
 
-const IDLE_W: c_int = 200;
-const IDLE_H: c_int = 40;
+const IDLE_W: c_int = 132;
+const IDLE_H: c_int = 36;
 const EXPANDED_W: c_int = 380;
 const EXPANDED_H: c_int = 176;
 const MIN_W: c_int = 280; // compact banner: art left, equalizer right
@@ -127,9 +124,9 @@ const island_css =
     \\#dockh-island.expanded {
     \\    border-radius: 42px;
     \\}
-    \\/* Pop-out sections fit content with 8px padding; labels cap width. */
+    \\/* Sections fit content; padding keeps text off the capsule border. */
     \\#island-music, #island-notif, #island-osd, #island-shot {
-    \\    padding: 8px;
+    \\    padding: 12px;
     \\}
     \\
     \\@keyframes island-pop {
@@ -438,6 +435,7 @@ fn recenter() void {
 // ---------------------------------------------------------------------------
 
 fn createIdleSection() ?*anyopaque {
+    // Empty black capsule — clean "nothing playing" state, like macOS.
     const box = c.gtk_box_new(c.ORIENTATION_HORIZONTAL, 0);
     idle_box = box;
     // Layer-shell windows size to content; a fixed size request keeps the
@@ -445,15 +443,6 @@ fn createIdleSection() ?*anyopaque {
     c.gtk_widget_set_size_request(box, IDLE_W, IDLE_H);
     c.gtk_widget_set_halign(box, c.ALIGN_CENTER);
     c.gtk_widget_set_valign(box, c.ALIGN_CENTER);
-
-    clock_label = c.gtk_label_new("--:--");
-    c.gtk_widget_set_name(clock_label, "island-clock");
-    c.gtk_box_append(box, clock_label);
-
-    battery_label = c.gtk_label_new("");
-    c.gtk_widget_set_name(battery_label, "island-battery");
-    c.gtk_widget_set_visible(battery_label, 0);
-    c.gtk_box_append(box, battery_label);
     return box;
 }
 
@@ -796,12 +785,11 @@ fn createIslandWindow() void {
     _ = c.g_signal_connect(motion, "enter", @ptrCast(&onIslandEnter), null);
     _ = c.g_signal_connect(motion, "leave", @ptrCast(&onIslandLeave), null);
 
-    // Always visible from the start: a small pill with the clock.
+    // Always visible from the start: the small empty black pill.
     c.gtk_widget_show(win);
     // Center it NOW — setMode(.idle) would early-return (mode is already
     // .idle), leaving the pill stuck at the top-left corner.
     recenter();
-    startClock();
 }
 
 // ---------------------------------------------------------------------------
@@ -923,34 +911,6 @@ fn onNotifClicked(_: ?*anyopaque, _: c_int, _: f64, _: f64, _: ?*anyopaque) call
     if (mode != .notif) return;
     cancelNotifTimer();
     returnToPrev();
-}
-
-// ---------------------------------------------------------------------------
-// Idle clock
-// ---------------------------------------------------------------------------
-
-fn tickClock() void {
-    if (clock_label == null) return;
-    var now: i64 = 0;
-    _ = c.time(&now);
-    var tm: c.Tm = .{};
-    if (c.localtime_r(&now, &tm) == null) return;
-    var buf: [8]u8 = undefined;
-    const n = c.strftime(&buf, buf.len, "%H:%M", &tm);
-    if (n == 0) return;
-    const z = state.alloc.dupeZ(u8, buf[0..n]) catch return;
-    c.gtk_label_set_text(clock_label, z.ptr);
-}
-
-fn onClockTick(_: ?*anyopaque) callconv(.c) c_int {
-    tickClock();
-    return 1; // keep the timer
-}
-
-fn startClock() void {
-    if (clock_timer != 0) return;
-    tickClock();
-    clock_timer = c.g_timeout_add(30_000, @ptrCast(&onClockTick), null);
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,7 +1421,6 @@ pub fn showScreenshot(path: []const u8) void {
 /// discharging. `pct` in 0..100, `present` false hides the label entirely.
 pub fn setBattery(pct: i32, charging: bool, present: bool) void {
     if (!state.cfg.island_enabled) return;
-    if (battery_label == null) return;
 
     const same = pct == last_battery_pct and charging == last_battery_charging;
     if (same and !charging) return; // unchanged
@@ -1469,25 +1428,8 @@ pub fn setBattery(pct: i32, charging: bool, present: bool) void {
     last_battery_charging = charging;
 
     if (!present) {
-        c.gtk_widget_set_visible(battery_label, 0);
         battery_warned = false;
         return;
-    }
-
-    c.gtk_widget_set_visible(battery_label, 1);
-    const txt = std.fmt.allocPrint(state.alloc, "{d}%", .{pct}) catch return;
-    const z = state.alloc.dupeZ(u8, txt) catch return;
-    c.gtk_label_set_text(battery_label, z.ptr);
-
-    // Color states: normal / low (< 20%) / critical (< 10%).
-    if (battery_label) |lbl| {
-        c.gtk_widget_remove_css_class(lbl, "low");
-        c.gtk_widget_remove_css_class(lbl, "critical");
-        if (pct <= 10) {
-            c.gtk_widget_add_css_class(lbl, "critical");
-        } else if (pct <= 20) {
-            c.gtk_widget_add_css_class(lbl, "low");
-        }
     }
 
     // One-shot low-battery warning when crossing 20% while discharging.
@@ -1505,8 +1447,4 @@ pub fn setBattery(pct: i32, charging: bool, present: bool) void {
 pub fn deinit() void {
     cancelNotifTimer();
     cancelShrinkTimer();
-    if (clock_timer != 0) {
-        _ = c.g_source_remove(clock_timer);
-        clock_timer = 0;
-    }
 }
